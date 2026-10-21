@@ -41,8 +41,8 @@ func NewServer(cfg *config.Config, db *store.DB, log *slog.Logger) *Server {
 	return s
 }
 
-// Handler 返回 http.Handler。
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler 返回 http.Handler（已套访问控制中间件）。
+func (s *Server) Handler() http.Handler { return s.authMiddleware(s.mux) }
 
 func (s *Server) routes() {
 	// 健康检查
@@ -72,6 +72,12 @@ func (s *Server) routes() {
 
 	// 下钻接口（详情页必用）
 	s.registerDrilldown()
+
+	// 实时推送（WebSocket）
+	s.mux.HandleFunc("GET /ws", s.handleWS)
+
+	// 访问控制
+	s.registerAuth()
 
 	// 前端静态资源（若 web/out 存在）
 	s.mountStatic()

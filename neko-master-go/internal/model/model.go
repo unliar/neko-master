@@ -144,3 +144,26 @@ type ConnectionsResponse struct {
 type HealthResponse struct {
 	Status string `json:"status"`
 }
+
+// StatsSummary 是 WebSocket 推送帧里的 data 字段。
+//
+// 对齐 shared 的 StatsSummary（仅保留已实现字段，其余省略）。
+type StatsSummary struct {
+	TotalConnections int64 `json:"totalConnections"`
+	TotalUpload      int64 `json:"totalUpload"`
+	TotalDownload    int64 `json:"totalDownload"`
+	TotalDomains     int64 `json:"totalDomains"`
+	TotalIPs         int64 `json:"totalIPs"`
+	TotalRules       int64 `json:"totalRules"`
+	TotalProxies     int64 `json:"totalProxies"`
+
+	TopDomains  any `json:"topDomains,omitempty"`
+	TopIPs      any `json:"topIps,omitempty"`
+	ProxyStats  any `json:"proxyStats,omitempty"`
+	RuleStats   any `json:"ruleStats,omitempty"`
+	HourlyStats any `json:"hourlyStats,omitempty"`
+
+	// 内部用于变更检测的计数，不参与序列化
+	TopDomainCount int `json:"-"`
+	RuleStatCount  int `json:"-"`
+}
