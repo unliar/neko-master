@@ -68,7 +68,7 @@ Go 版本：
 | Surge 网关采集 | `internal/gateway/surge.go` + `internal/collector/surge_tracker.go`：轮询 `/v1/requests/recent`，`x-key` 鉴权，策略链从 notes 解析 | `surge.collector.ts`（933 行） |
 | Surge 网关 API | `/api/gateway/proxies` 走 `/v1/policies/{name}`；`/providers/proxies` 走 `/v1/policy_groups/select`（风险点 27，两路由不合并）；`rules` 走 `parseSurgeRule`（`FINAL`→`MATCH`） | `gateway-utils.ts` |
 | ClickHouse 双写 | `internal/clickhouse`：SQLite 为主 + CH 旁路，写入统一走 `*_buffer` 表，`CH_ENABLED != 1` 时完全 no-op | `clickhouse.config.ts` / `clickhouse.writer.ts` |
-| 实时叠加 | `internal/realtime`：采集器每轮写内存 buffer，`Summary()` 叠加回去；flush 后立即 `Prune()` 避重复计数 | `realtime-store.ts` |
+| 实时叠加 | `internal/realtime`：逐函数对齐上游 `realtime-store.ts`（`recordTraffic` / `getSummaryDelta` / `getTodayDelta` / `clearTraffic*` / `pruneOldBuckets`） | summary 为累加器，仅在 flush 成功后清零 |
 
 ### 配置变量
 
@@ -178,7 +178,7 @@ neko-master/                 ← fork，前端不动
 
 | 项 | 上游行为 | Go 实现 | 原因 |
 |---|---|---|---|
-| 实时叠加 | DTO 会叠加内存 buffer | 已实现（`internal/realtime`）；flush 后 `Prune` 避重复计数 | 改为已实现 |
+| 实时叠加 | DTO 会叠加内存 buffer | 已实现且逐函数对齐；flush 失败时保留以供重试，成功才 `clearTraffic` | 上游维拄 8 个维度 Map，Go 侧仅实现 summary/minute 两个（维度 Map Summary 不读） |
 | `country_stats` | 两处定义冲突 | 按 `shared` 版（含可选 `lastSeen`） | 与前端一致 |
 | `rules/*/proxy-stats` | 无时间范围时恒返回 `[]` | 复刻该行为 | 源码级不一致，见 API-DETAILS §1.16 |
 | `trend/aggregated` 日对齐 | 走 `strftime` 平移 | Go 侧时间平移实现 | 数值等价 |

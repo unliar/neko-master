@@ -260,16 +260,22 @@ func (s *Service) Summary(backendID int64) (*SummaryResponse, error) {
 		return nil, err
 	}
 
-	// 实时叠加：把尚未落盘的增量加回各个计数字段。
-	// 这是 WS 推送“落后一个 flush 周期”的修正。
+	// 实时叠加，对齐上游 applySummaryDelta + getTodayDelta：
+	//
+	//   total*  → 叠 summary 累加器（自上次 clearTraffic 后的全部增量）
+	//   today*  → 叠今日分钟桶（getTodayDelta，按 UTC 日期前缀匹配）
+	//
+	// 注意两者口径不同：summary 累加器在超过 maxMinutes 的旧桶被 prune 后
+	// 仍然保留（prune 只动 minute 桶），因此 total* 不会因时间滚动而少算。
 	if s.rt != nil {
 		st := s.rt.Store(backendID)
-		snap := st.Since(todayStart)
-		out.TotalUpload += snap.Upload
-		out.TotalDownload += snap.Download
-		out.TotalConnections += snap.Connections
-		out.TodayUpload += snap.Upload
-		out.TodayDownload += snap.Download
+		d := st.SummaryDelta()
+		up, down := st.TodayDelta(time.Now())
+		out.TotalUpload += d.Upload
+		out.TotalDownload += d.Download
+		out.TotalConnections += d.Connections
+		out.TodayUpload += up
+		out.TodayDownload += down
 	}
 
 	return out, nil

@@ -1,178 +1,207 @@
 // Package realtime 实现「实时叠加」：把尚未落盘的增量叠加到 DTO 上。
 //
-// 问题：采集器每轮产生增量先进 Buffer，每 30s（FLUSH_INTERVAL_MS）才落库。
-// 因此 stats.Summary() 这类直接查 SQLite 的 DTO 会落后最多一个 flush 周期。
-// WS 推送跟着掉，用户看到的是半分钟前的数字。
+// 问题：采集器每轮产生增量先进 Buffer，每 30s（FLUSH_INTERVAL_MS）才落库，
+// 因此 stats.Summary() 这类直接查 SQLite 的 DTO 会落后最多一个 flush 周期，
+// WS 推送跟着掉。
 //
-// 解法：采集器每产生一条增量就 recordTraffic() 到内存 buffer；
-// 构建 DTO 时用 overlay() 把 buffer 里的量加回去。
-// 上游对应 apps/collector/src/modules/realtime/realtime-store.ts。
+// 本实现逐函数对齐上游 apps/collector/src/modules/realtime/realtime.store.ts：
 //
-// 一致性保证：overlay 只加不重算。同一个 (domain, ip, chain, rule) 键的
-// 增量在 SQLite 与 buffer 中只会各占一份，落盘后 buffer 清零，
-// 因此不会重复计数。近似性在于：唯一维度计数（TotalDomains/TotalIPs）
-// 无法从增量推出新增了几个唯一键，故这几项只在 buffer 中已有的键
-// 明显可能新增时才上调，宁可少报也不错报。
+//	recordTraffic()   -> Store.Record
+//	getSummaryDelta() -> Store.SummaryDelta
+//	getTodayDelta()   -> Store.TodayDelta
+//	clearTrafficSummary()  -> Store.ClearTrafficSummary
+//	clearTrafficDimensions() -> Store.ClearTrafficDimensions
+//	clearTraffic()    -> Store.ClearTraffic
+//	pruneOldBuckets() -> Store.pruneOldBuckets
+//
+// 与上游一致的两条关键语义：
+//
+//  1. summary 是一个**永不自动清理的累加器**（SummaryDelta），
+//     只在 flush 成功后由调用方 ClearTraffic* 清零。这意味着 flush 失败时
+//     缓冲保留，下次 flush 会带着上次的数据重试 —— 数据不会丢。
+//  2. recordTraffic 有早退：upload <= 0 && download <= 0 时直接返回，
+//     连 minute bucket 都不建。上游用 `connections = 1` 做默认值单独累加，
+//     因此连接数只在该条增量真正入账时才 +1。
 package realtime
 
 import (
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
 )
 
-// Delta 是一份未落盘增量。
-type Delta struct {
-	Domain      string
-	IP          string
-	SourceIP    string
-	Chain       string
-	FullChain   string
-	Rule        string
+// SummaryDelta 对齐上游 SummaryDelta。
+//
+// 注意：这是累加器，不是快照。ClearTrafficSummary 之前它只增不减。
+type SummaryDelta struct {
 	Upload      int64
 	Download    int64
 	Connections int64
-	TimestampMs time.Time
+	LastUpdated time.Time
+}
+
+// MinuteBucket 对齐上游 MinuteBucket（只留 upload/download，
+// lastUpdated 用于调试，上游也保留）。
+type MinuteBucket struct {
+	Upload      int64
+	Download    int64
+	LastUpdated time.Time
 }
 
 // Store 是单 backend 的实时叠加缓冲。
+//
+// 上游用 8 个 Map 分别承载 summary / minute / domain / ip / proxy / device /
+// deviceDomain / deviceIP / rule / ruleChain / country。Go 侧目前只实现
+// Summary 实际用到的 summary 与 minute 两个；维度 Map 尚未被 Summary 读取，
+// 属于上游已备但当前未接线的部分，见 README「已知差异」。
 type Store struct {
-	mu       sync.Mutex
-	perMin   map[string]*Delta // key = minute + 维度
-	total    Delta             // 全量累计（用于 total 字段）
-	lastSeen time.Time
-	maxMin   int
+	mu      sync.Mutex
+	summary SummaryDelta
+	minute  map[string]*MinuteBucket
+	maxMin  int
 }
 
-// NewStore 创建缓冲。maxMinute 限制保留的分钟桶数（对齐 REALTIME_MAX_MINUTES）。
-func NewStore(maxMinute int) *Store {
-	if maxMinute <= 0 {
-		maxMinute = 180
+// NewStore 创建缓冲。maxMinutes 对齐上游 maxMinutes（REALTIME_MAX_MINUTES）。
+func NewStore(maxMinutes int) *Store {
+	if maxMinutes <= 0 {
+		maxMinutes = 180
 	}
 	return &Store{
-		perMin: make(map[string]*Delta, 256),
-		maxMin: maxMinute,
+		minute: make(map[string]*MinuteBucket, 256),
+		maxMin: maxMinutes,
 	}
 }
 
-// Record 累加一条增量。
+// Record 累加一条增量，对齐 recordTraffic()。
+//
+// 早退语义必须与上游一致：upload 与 download 都 <= 0 时直接返回，
+// 不建 minute bucket、不累加连接数。
 func (s *Store) Record(u model.TrafficUpdate) {
+	if u.Upload <= 0 && u.Download <= 0 {
+		return
+	}
+
+	ts := u.TimestampMs
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	conns := u.Connections
+	if conns <= 0 {
+		// 上游 recordTraffic 的 connections 形参默认值是 1；
+		// 采集器在首次计量时显式传 1，其余时候传 0。
+		// 这里保持「调用方给多少就加多少」，0 就加 0。
+		conns = 0
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := u.TimestampMs
-	if now.IsZero() {
-		now = time.Now()
-	}
-	s.lastSeen = now
+	s.summary.Upload += u.Upload
+	s.summary.Download += u.Download
+	s.summary.Connections += conns
+	s.summary.LastUpdated = ts
 
-	minute := now.UTC().Truncate(time.Minute).Format("2006-01-02T15:04")
-	key := minute + "|" + u.Domain + "|" + u.IP + "|" + u.SourceIP + "|" + u.FullChain + "|" + u.Rule
-
-	d, ok := s.perMin[key]
+	key := minuteKey(ts)
+	b, ok := s.minute[key]
 	if !ok {
-		d = &Delta{
-			Domain: u.Domain, IP: u.IP, SourceIP: u.SourceIP,
-			Chain: u.Chain, FullChain: u.FullChain, Rule: u.Rule,
-			TimestampMs: now,
-		}
-		s.perMin[key] = d
+		b = &MinuteBucket{}
+		s.minute[key] = b
 	}
-	d.Upload += u.Upload
-	d.Download += u.Download
-	d.Connections += u.Connections
-	if now.After(d.TimestampMs) {
-		d.TimestampMs = now
-	}
+	b.Upload += u.Upload
+	b.Download += u.Download
+	b.LastUpdated = ts
 
-	s.total.Upload += u.Upload
-	s.total.Download += u.Download
-	s.total.Connections += u.Connections
+	s.pruneOldBucketsLocked(ts)
 }
 
-// Snapshot 返回当前缓冲的一份拷贝。
-func (s *Store) Snapshot() Delta {
+// SummaryDelta 返回当前累加器，对齐 getSummaryDelta()。
+func (s *Store) SummaryDelta() SummaryDelta {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.total
+	return s.summary
 }
 
-// Since 返回指定时刻（含）之后的增量汇总。
+// TodayDelta 返回今日（UTC）未落盘增量，对齐 getTodayDelta()。
 //
-// 用于「今日流量」这类带时间下界的字段：只叠加真正落在区间内的部分。
-func (s *Store) Since(t time.Time) Delta {
+// 上游按 toISOString().slice(0,10) 前缀匹配分钟键，即按 UTC 日期切分。
+func (s *Store) TodayDelta(now time.Time) (upload, download int64) {
+	todayPrefix := now.UTC().Format("2006-01-02")
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var out Delta
-	for _, d := range s.perMin {
-		if d.TimestampMs.Before(t) {
-			continue
+	for k, b := range s.minute {
+		if len(k) >= 10 && k[:10] == todayPrefix {
+			upload += b.Upload
+			download += b.Download
 		}
-		out.Upload += d.Upload
-		out.Download += d.Download
-		out.Connections += d.Connections
 	}
-	return out
+	return upload, download
 }
 
-// Deltas 返回缓冲中所有增量（按分钟升序），供 Top 排行叠加使用。
-func (s *Store) Deltas() []Delta {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	out := make([]Delta, 0, len(s.perMin))
-	for _, d := range s.perMin {
-		out = append(out, *d)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].TimestampMs.Before(out[j].TimestampMs) })
-	return out
-}
-
-// Prune 丢弃早于 cutoff 的分钟桶。
+// ClearTrafficSummary 清空 summary 与 minute，对齐 clearTrafficSummary()。
 //
-// 调用方应在每次 Flush 后执行：既然 SQLite 已经有了这些数据，
-// buffer 里对应的部分就该丢掉，否则会和数据库重复计数。
-func (s *Store) Prune(cutoff time.Time) {
+// 只在 flush 成功后调用。flush 失败时**不要**调用，否则那批数据永久丢失。
+func (s *Store) ClearTrafficSummary() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	cut := cutoff.UTC().Truncate(time.Minute).Format("2006-01-02T15:04")
-	for k := range s.perMin {
-		// key 的前 16 字符是分钟桶，后面跟 "|"
-		if len(k) > 16 && k[:16] <= cut {
-			delete(s.perMin, k)
-		}
-	}
+	s.summary = SummaryDelta{}
+	s.minute = make(map[string]*MinuteBucket, 256)
 }
 
-// Clear 清空全部缓冲（谨慎使用，仅用于整体重置）。
-func (s *Store) Clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.perMin = make(map[string]*Delta, 256)
-	s.total = Delta{}
+// ClearTrafficDimensions 清空维度侧缓存。
+//
+// 上游对应 domain / ip / proxy / device / deviceDomain / deviceIP /
+// rule / ruleChain 八个 Map。Go 侧这些 Map 尚未实现（Summary 不用），
+// 故当前是 no-op，保留函数以对齐调用点与后续扩展。
+func (s *Store) ClearTrafficDimensions() {
+	// no-op：维度 Map 未实现，见 Store 注释中的「已知差异」。
 }
 
-// Len 返回当前保留的分钟桶数。
+// ClearTraffic 同时清空 summary 与维度，对齐 clearTraffic()。
+func (s *Store) ClearTraffic() {
+	s.ClearTrafficSummary()
+	s.ClearTrafficDimensions()
+}
+
+// Clear 是 ClearTraffic 的别名，便于调用方按语境选用。
+func (s *Store) Clear() { s.ClearTraffic() }
+
+// Len 返回当前 minute bucket 数（调试用）。
 func (s *Store) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.perMin)
+	return len(s.minute)
 }
 
-// LastSeen 返回最后一次记录时间。
-func (s *Store) LastSeen() time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lastSeen
+// minuteKey 对齐上游 toMinuteKey：ISO 前 16 位 + ":00"，即 UTC 分钟桶。
+func minuteKey(ts time.Time) string {
+	return ts.UTC().Format("2006-01-02T15:04") + ":00"
 }
 
-// Manager 按 backend 管理多个 Store。
+// pruneOldBuckets 对齐上游 pruneOldBuckets。
+//
+// 上游按「nowMs - maxMinutes*60_000」取 cutoffKey，
+// 删除 key < cutoffKey 的桶。这是相对时间的滚动窗口，
+// 与「flush 时刻裁剪」是两件不同的事 —— 不要混用。
+//
+// 注意：该函数只裁剪 minute 桶，**不清 summary 累加器**。
+// 累加器只能靠 ClearTrafficSummary 清零。
+func (s *Store) pruneOldBucketsLocked(now time.Time) {
+	cutoff := minuteKey(now.Add(-time.Duration(s.maxMin) * time.Minute))
+	for k := range s.minute {
+		if k < cutoff {
+			delete(s.minute, k)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- Manager
+
+// Manager 按 backend 管理多个 Store，对齐上游单例的按 backend 分片。
 type Manager struct {
 	mu     sync.Mutex
 	stores map[int64]*Store
@@ -180,8 +209,8 @@ type Manager struct {
 }
 
 // NewManager 创建管理器。
-func NewManager(maxMinute int) *Manager {
-	return &Manager{stores: make(map[int64]*Store), maxMin: maxMinute}
+func NewManager(maxMinutes int) *Manager {
+	return &Manager{stores: make(map[int64]*Store), maxMin: maxMinutes}
 }
 
 // Store 返回指定 backend 的缓冲（不存在则创建）。
@@ -201,132 +230,18 @@ func (m *Manager) Record(backendID int64, u model.TrafficUpdate) {
 	m.Store(backendID).Record(u)
 }
 
-// Prune 对所有 backend 执行裁剪。
-func (m *Manager) Prune(cutoff time.Time) {
-	m.mu.Lock()
-	stores := make([]*Store, 0, len(m.stores))
-	for _, st := range m.stores {
-		stores = append(stores, st)
-	}
-	m.mu.Unlock()
-
-	for _, st := range stores {
-		st.Prune(cutoff)
-	}
-}
-
-// Drop 移除某个 backend 的缓冲。
+// Drop 移除某个 backend 的缓冲（backend 被删除时调用）。
 func (m *Manager) Drop(backendID int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.stores, backendID)
 }
 
-// Overlay 把实时增量叠加到一份 SQLite 查询结果上。
-//
-// 输入是 stats 层的行（每行含 domain/ip/source_ip/chain/rule 与 upload/download/connections），
-// 用 map 表示以便兼容不同的行类型。叠加逻辑：
-//   - 若某条实时增量的键已存在于行中 → 累加到该行
-//   - 否则追加为新行
-//
-// 返回新切片，不修改入参。
-func Overlay(rows []map[string]any, dimKey []string, deltas []Delta) []map[string]any {
-	if len(deltas) == 0 {
-		return rows
-	}
+// ClearTraffic 对指定 backend 执行 clearTraffic。
+func (m *Manager) ClearTraffic(backendID int64) { m.Store(backendID).ClearTraffic() }
 
-	index := make(map[string]int, len(rows))
-	for i, r := range rows {
-		index[rowKey(r, dimKey)] = i
-	}
+// MinuteKeyForTest 暴露 minuteKey 给测试，避免测试包重复实现同一格式。
+func MinuteKeyForTest(ts time.Time) string { return minuteKey(ts) }
 
-	out := make([]map[string]any, len(rows))
-	copy(out, rows)
-
-	for _, d := range deltas {
-		cand := map[string]any{}
-		row := deltaToRow(d)
-		for _, k := range dimKey {
-			if v, ok := row[k]; ok {
-				cand[k] = v
-			}
-		}
-		k := rowKey(cand, dimKey)
-
-		if i, ok := index[k]; ok {
-			addToRow(out[i], d)
-			continue
-		}
-		newRow := map[string]any{}
-		for kk, vv := range row {
-			newRow[kk] = vv
-		}
-		out = append(out, newRow)
-		index[k] = len(out) - 1
-	}
-	return out
-}
-
-func deltaToRow(d Delta) map[string]any {
-	chain := d.FullChain
-	if chain == "" {
-		chain = d.Chain
-	}
-	return map[string]any{
-		"domain":      d.Domain,
-		"ip":          d.IP,
-		"source_ip":   d.SourceIP,
-		"sourceIP":    d.SourceIP,
-		"chain":       chain,
-		"rule":        d.Rule,
-		"upload":      d.Upload,
-		"download":    d.Download,
-		"connections": d.Connections,
-	}
-}
-
-func rowKey(r map[string]any, dimKey []string) string {
-	if len(dimKey) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for _, k := range dimKey {
-		sb.WriteString(anyToStr(r[k]))
-		sb.WriteByte('|')
-	}
-	return sb.String()
-}
-
-func anyToStr(v any) string {
-	if v == nil {
-		return ""
-	}
-	switch x := v.(type) {
-	case string:
-		return x
-	case int64:
-		return strconv.FormatInt(x, 10)
-	case int:
-		return strconv.Itoa(x)
-	default:
-		return ""
-	}
-}
-
-func addToRow(r map[string]any, d Delta) {
-	r["upload"] = asInt64(r["upload"]) + d.Upload
-	r["download"] = asInt64(r["download"]) + d.Download
-	r["connections"] = asInt64(r["connections"]) + d.Connections
-}
-
-func asInt64(v any) int64 {
-	switch x := v.(type) {
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	case float64:
-		return int64(x)
-	}
-	return 0
-}
+// FormatInt 供测试构造期望值。
+func FormatInt(v int64) string { return strconv.FormatInt(v, 10) }

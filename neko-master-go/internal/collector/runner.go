@@ -137,10 +137,12 @@ func (r *Runner) sync(ctx context.Context) {
 			continue
 		}
 		w.cancel()
-		// 最后一次刷盘
+		// 最后一次刷盘；成功才清 realtime，失败保留以便下次启动后续写。
 		if updates := w.buffer.Drain(); len(updates) > 0 {
 			if err := r.writer.Flush(id, updates); err != nil {
 				r.log.Error("collector: final flush", "backend", id, "err", err)
+			} else {
+				w.rt.ClearTraffic()
 			}
 		}
 		r.realtime.Drop(id)
@@ -266,17 +268,27 @@ func (r *Runner) runSurgeWorker(ctx context.Context, w *worker) {
 }
 
 // flushOnce 把缓冲区落库。
+//
+// realtime 清理时机对齐上游 gateway.collector.ts 的 flushBatch：
+//
+//	落盘成功 → clearTraffic()，否则保留缓冲供下次重试。
+//
+// 上游在 ClickHouse 开启时会把 detail / agg 分开判定（只成功一半时只清对应侧）。
+// Go 侧目前 ClickHouse 是纯旁路且写入失败不影响主流程，
+// 因此这里只按 SQLite 事务结果决定：SQLite 成功即清，失败则不清。
 func (r *Runner) flushOnce(w *worker) {
 	updates := w.buffer.Drain()
 	if len(updates) == 0 {
 		return
 	}
 	if err := r.writer.Flush(w.target.ID, updates); err != nil {
-		r.log.Error("collector: flush failed", "backend", w.target.ID, "count", len(updates), "err", err)
+		// 上游注释原话：retaining realtime store。
+		// 不清 buffer，下次 flush 会带着这批数据重试。
+		r.log.Error("collector: flush failed, retaining realtime store",
+			"backend", w.target.ID, "count", len(updates), "err", err)
 		return
 	}
-	// 落盘成功后立即裁剪 realtime buffer，避免与数据库重复计数。
-	w.rt.Prune(time.Now())
+	w.rt.ClearTraffic()
 	r.log.Debug("collector: flushed", "backend", w.target.ID, "count", len(updates))
 }
 
@@ -287,8 +299,9 @@ func (r *Runner) stopAll() {
 	for id, w := range r.workers {
 		w.cancel()
 		if updates := w.buffer.Drain(); len(updates) > 0 {
-			_ = r.writer.Flush(id, updates)
-			w.rt.Prune(time.Now())
+			if err := r.writer.Flush(id, updates); err == nil {
+				w.rt.ClearTraffic()
+			}
 		}
 		r.realtime.Drop(id)
 	}
