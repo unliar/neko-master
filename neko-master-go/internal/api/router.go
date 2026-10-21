@@ -60,15 +60,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/stats/hourly", s.handleHourly)
 	s.mux.HandleFunc("GET /api/stats/trend", s.handleTrend)
 
+	// 后端配置（列表带/不带斜杠都要注册）
+	s.mux.HandleFunc("GET /api/backends", s.handleBackendsList)
+	s.mux.HandleFunc("GET /api/backends/", s.handleBackendsList)
+	s.mux.HandleFunc("GET /api/backends/active", s.handleBackendActive)
+	s.mux.HandleFunc("GET /api/backends/listening", s.handleBackendListening)
+
 	// 网关代理
 	s.mux.HandleFunc("GET /api/gateway/proxies", s.handleGatewayProxies)
 	s.mux.HandleFunc("GET /api/gateway/rules", s.handleGatewayRules)
 	s.mux.HandleFunc("GET /api/gateway/providers/proxies", s.handleGatewayProviders)
-
-	// 后端配置
-	s.mux.HandleFunc("GET /api/backends/", s.handleBackendsList)
-	s.mux.HandleFunc("GET /api/backends/active", s.handleBackendActive)
-	s.mux.HandleFunc("GET /api/backends/listening", s.handleBackendListening)
 
 	// 下钻接口（详情页必用）
 	s.registerDrilldown()
@@ -78,6 +79,22 @@ func (s *Server) routes() {
 
 	// 访问控制
 	s.registerAuth()
+
+	// Phase 2：backend CRUD / agent 上报 / 数据库运维
+	s.registerBackends()
+	s.registerAgent()
+	s.registerDB()
+
+	// 已废弃但保留兼容：/api/stats/connections 恒返回空
+	s.mux.HandleFunc("GET /api/stats/connections", s.handleConnectionsLegacy)
+
+	// 规则链路图
+	s.mux.HandleFunc("GET /api/stats/rules/chain-flow", s.handleChainFlow)
+	s.mux.HandleFunc("GET /api/stats/rules/chain-flow-all", s.handleChainFlowAll)
+	s.mux.HandleFunc("GET /api/stats/rule-proxy-map", s.handleRuleProxyMap)
+
+	// Surge 专用：刷新 provider
+	s.mux.HandleFunc("POST /api/gateway/providers/proxies/refresh", s.handleProviderRefresh)
 
 	// 前端静态资源（若 web/out 存在）
 	s.mountStatic()
@@ -438,62 +455,12 @@ func (s *Server) handleGatewayProviders(w http.ResponseWriter, r *http.Request) 
 
 // ---------------------------------------------------------------- backends
 
-func (s *Server) handleBackendsList(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.SQL().Query(`
-		SELECT id, name, url, type, enabled, is_active, listening
-		FROM backend_configs ORDER BY id`)
-	if err != nil {
-		s.writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+// maskToken 只表明 token 是否存在，不返回明文。
+func maskToken(tok string) string {
+	if tok == "" {
+		return ""
 	}
-	defer rows.Close()
-
-	out := []model.Backend{}
-	for rows.Next() {
-		var b model.Backend
-		var enabled, isActive, listening int
-		if err := rows.Scan(&b.ID, &b.Name, &b.URL, &b.Type, &enabled, &isActive, &listening); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		b.Enabled = enabled != 0
-		b.IsActive = isActive != 0
-		b.Listening = listening != 0
-		out = append(out, b)
-	}
-	s.writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) handleBackendActive(w http.ResponseWriter, r *http.Request) {
-	id, err := s.stats.ActiveBackendID()
-	if err != nil {
-		s.writeJSON(w, http.StatusOK, nil)
-		return
-	}
-	be, err := s.stats.GetBackend(id)
-	if err != nil {
-		s.writeJSON(w, http.StatusOK, nil)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, be)
-}
-
-func (s *Server) handleBackendListening(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.SQL().Query(`SELECT id FROM backend_configs WHERE listening = 1`)
-	if err != nil {
-		s.writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	defer rows.Close()
-	ids := []int64{}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	s.writeJSON(w, http.StatusOK, ids)
+	return "****"
 }
 
 // ---------------------------------------------------------------- 静态资源

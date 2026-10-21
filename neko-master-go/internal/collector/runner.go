@@ -218,3 +218,8 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// NewWriterFor 直接用一个已打开的 DB 构造 Writer。
+//
+// 供 agent 上报路径使用（它没有 Runner）。
+func NewWriterFor(db *store.DB) *store.Writer { return store.NewWriter(db) }

@@ -496,10 +496,9 @@ func (s *Service) Trend(backendID int64, start, end time.Time) ([]model.TrendPoi
 	out := []model.TrendPoint{}
 	for rows.Next() {
 		var p model.TrendPoint
-		if err := rows.Scan(&p.Timestamp, &p.Upload, &p.Download); err != nil {
+		if err := rows.Scan(&p.Time, &p.Upload, &p.Download); err != nil {
 			return nil, err
 		}
-		p.Total = p.Upload + p.Download
 		out = append(out, p)
 	}
 	return out, rows.Err()

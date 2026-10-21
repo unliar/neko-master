@@ -9,13 +9,14 @@ type Backend struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
 	URL       string `json:"url"`
-	Token     string `json:"-"`    // 绝不外泄
-	Type      string `json:"type"` // clash | surge | agent
+	Token     string `json:"token"` // 前端会读；实际只返回掩码
+	Type      string `json:"type"`
 	Enabled   bool   `json:"enabled"`
-	IsActive  bool   `json:"isActive"`
+	IsActive  bool   `json:"is_active"`
 	Listening bool   `json:"listening"`
-	CreatedAt string `json:"createdAt,omitempty"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
+	HasToken  bool   `json:"hasToken"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 // DomainStat 域名维度累计统计。
@@ -87,11 +88,16 @@ type CountryStats struct {
 }
 
 // TrendPoint 趋势序列上的一个点。
+//
+// 字段名必须与 shared 的 TrafficTrendPoint 一致：
+//
+//	interface TrafficTrendPoint { time, upload, download }
+//
+// 注意没有 total 字段 —— 前端自己算。
 type TrendPoint struct {
-	Timestamp string `json:"timestamp"`
-	Upload    int64  `json:"upload"`
-	Download  int64  `json:"download"`
-	Total     int64  `json:"total"`
+	Time     string `json:"time"`
+	Upload   int64  `json:"upload"`
+	Download int64  `json:"download"`
 }
 
 // Summary 总览响应。

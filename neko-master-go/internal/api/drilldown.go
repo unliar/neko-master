@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // registerDrilldown 注册全部下钻接口。
@@ -335,22 +337,45 @@ func (s *Server) handleDeviceIPs(w http.ResponseWriter, r *http.Request, id int6
 }
 
 // handleTrendAggregated 对应 GET /api/stats/trend/aggregated。
+//
+// 参数：minutes（默认30，上限10080）、bucketMinutes（默认1，上限1440）、
+// tzOffsetMinutes（-840~840）、backendId/start/end。
 func (s *Server) handleTrendAggregated(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolveBackendID(r)
 	if !ok || id == 0 {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
+	q := r.URL.Query()
+
+	minutes := parseLimit(q.Get("minutes"), 30, 60*24*7)
+	bucketMinutes := parseLimit(q.Get("bucketMinutes"), 1, 24*60)
+
+	tzOffset := 0
+	if v := q.Get("tzOffsetMinutes"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			tzOffset = n
+			if tzOffset < -840 {
+				tzOffset = -840
+			}
+			if tzOffset > 840 {
+				tzOffset = 840
+			}
+		}
+	}
+
 	start, end, active, msg := s.getTimeRange(r)
 	if msg != "" {
 		s.writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
-	if !active {
-		end = nowFunc()
-		start = end.Add(-24 * hourDur)
+
+	var startP, endP *time.Time
+	if active {
+		startP, endP = &start, &end
 	}
-	res, err := s.stats.Trend(id, start, end)
+
+	res, err := s.stats.TrendAggregated(id, minutes, bucketMinutes, tzOffset, startP, endP)
 	if err != nil {
 		s.log.Error("trend/aggregated", "err", err)
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
