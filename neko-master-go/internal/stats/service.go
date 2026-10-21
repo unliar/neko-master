@@ -11,16 +11,32 @@ import (
 	"time"
 
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
+	"github.com/unliar/neko-master/neko-master-go/internal/realtime"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
 )
 
 // Service 提供统计查询。
 type Service struct {
 	db *store.DB
+
+	// rt 提供实时叠加：把尚未落盘的增量加回 DTO。
+	// 为 nil 时行为与之前完全一致（不叠加）。
+	rt *realtime.Manager
 }
 
 // New 创建服务。
 func New(db *store.DB) *Service { return &Service{db: db} }
+
+// NewWithRealtime 创建带实时叠加的服务。
+func NewWithRealtime(db *store.DB, rt *realtime.Manager) *Service {
+	return &Service{db: db, rt: rt}
+}
+
+// AttachRealtime 挂上实时管理器（nil 表示关闭叠加）。
+func (s *Service) AttachRealtime(rt *realtime.Manager) { s.rt = rt }
+
+// Realtime 返回实时管理器。
+func (s *Service) Realtime() *realtime.Manager { return s.rt }
 
 // splitList 把逗号分隔字段拆成数组（保持去重后的原顺序）。
 func splitList(s string) []string {
@@ -242,6 +258,18 @@ func (s *Service) Summary(backendID int64) (*SummaryResponse, error) {
 		backendID, todayStart.Format("2006-01-02T15:04")+":00").
 		Scan(&out.TodayUpload, &out.TodayDownload); err != nil {
 		return nil, err
+	}
+
+	// 实时叠加：把尚未落盘的增量加回各个计数字段。
+	// 这是 WS 推送“落后一个 flush 周期”的修正。
+	if s.rt != nil {
+		st := s.rt.Store(backendID)
+		snap := st.Since(todayStart)
+		out.TotalUpload += snap.Upload
+		out.TotalDownload += snap.Download
+		out.TotalConnections += snap.Connections
+		out.TodayUpload += snap.Upload
+		out.TodayDownload += snap.Download
 	}
 
 	return out, nil

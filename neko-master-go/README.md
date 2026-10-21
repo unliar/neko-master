@@ -59,15 +59,41 @@ Go 版本：
 
 `go vet` / `gofmt` / `go test` 全部干净。
 
-## Phase 3 待做
+## Phase 3（已完成）
 
-| 能力 | 说明 |
-|---|---|
-| GeoIP / ASN 查询 | 表已建好（`geoip_cache` / `asn_cache`），`maxmind` MMDB 本地查与在线 API 两条路都未接线 |
-| WebSocket 分页与下钻推送 | `subscribe` 的 `includeDomainsPage` / `includeIPsPage` / 各 Detail 字段已解析，尚未填充进推送帧 |
-| Surge 网关采集 | HTTP 轮询路径未实现；`/api/gateway/*` 的 Surge 分支返回 Clash 形态 |
-| ClickHouse 双写 | 表结构已知，未实现；SQLite 已够用 |
-| 实时叠加 | DTO 不叠加内存 buffer，`summary` 最新数据会晚最多一个 flush 周期（默认 30s） |
+| 能力 | 实现 | 对齐上游 |
+|---|---|---|
+| GeoIP / ASN 查询 | `internal/geo`（纯 Go MMDB 解析器 + 在线 API 回落） | `geoip_cache` / `asn_cache` 双层缓存 |
+| WebSocket 分页与下钻推送 | `includeDomainsPage` / `includeIPsPage` / 各 Detail 字段已填充推送帧 | `websocket.types.ts` |
+| Surge 网关采集 | `internal/gateway/surge.go` + `internal/collector/surge_tracker.go`：轮询 `/v1/requests/recent`，`x-key` 鉴权，策略链从 notes 解析 | `surge.collector.ts`（933 行） |
+| Surge 网关 API | `/api/gateway/proxies` 走 `/v1/policies/{name}`；`/providers/proxies` 走 `/v1/policy_groups/select`（风险点 27，两路由不合并）；`rules` 走 `parseSurgeRule`（`FINAL`→`MATCH`） | `gateway-utils.ts` |
+| ClickHouse 双写 | `internal/clickhouse`：SQLite 为主 + CH 旁路，写入统一走 `*_buffer` 表，`CH_ENABLED != 1` 时完全 no-op | `clickhouse.config.ts` / `clickhouse.writer.ts` |
+| 实时叠加 | `internal/realtime`：采集器每轮写内存 buffer，`Summary()` 叠加回去；flush 后立即 `Prune()` 避重复计数 | `realtime-store.ts` |
+
+### 配置变量
+
+```bash
+# ClickHouse 双写（默认关闭）
+CH_ENABLED=1              # 只有 1 才启用
+CH_HOST=clickhouse
+CH_PORT=8123
+CH_DATABASE=neko_master
+CH_USER=default
+CH_PASSWORD=
+CH_REQUIRED=1             # 1 = 连不上就启动失败；0 = 告警后降级为禁用
+CH_AUTO_CREATE_TABLES=1   # 0 = 跳过建表
+CH_UNHEALTHY_THRESHOLD=5  # 连续失败次数，超阈自动关闭双写
+CH_WRITE_MAX_PENDING_ROWS=200000
+```
+
+### Surge backend 注意事项
+
+- **`remoteAddress` 不是真实落地 IP**。Surge 的 DNS 解析发生在代理服务器侧，因此走代理时
+  `remoteHost` 是目标域名、`remoteAddress` 只能拿到代理节点 IP。直连（`remoteHost`
+  本身就是 IP）时才能得到真实 IP。
+- **`inBytes` / `outBytes` 方向与 Clash 相反**：`in` 是下载，`out` 是上传。
+- **完成的请求可能在后续轮询中重复出现**，因此用 `recentlyCompleted`
+  记录最终字节值（TTL 5 分钟）防重复计数。
 
 完整契约见 [`../API-DETAILS.md`](../API-DETAILS.md)（2650 行，从上游源码逐函数提取，含 40 个重写风险点）。
 
@@ -152,13 +178,13 @@ neko-master/                 ← fork，前端不动
 
 | 项 | 上游行为 | Go 实现 | 原因 |
 |---|---|---|---|
-| 实时叠加 | DTO 会叠加内存 buffer | 只读已落库数据 | 待补；`summary` 会晚最多一个 flush 周期 |
+| 实时叠加 | DTO 会叠加内存 buffer | 已实现（`internal/realtime`）；flush 后 `Prune` 避重复计数 | 改为已实现 |
 | `country_stats` | 两处定义冲突 | 按 `shared` 版（含可选 `lastSeen`） | 与前端一致 |
 | `rules/*/proxy-stats` | 无时间范围时恒返回 `[]` | 复刻该行为 | 源码级不一致，见 API-DETAILS §1.16 |
 | `trend/aggregated` 日对齐 | 走 `strftime` 平移 | Go 侧时间平移实现 | 数值等价 |
-| ClickHouse | 支持双写与查询路由 | 未实现 | SQLite 足够；后续可选 |
-| Surge 网关 | 支持 HTTP 轮询 | 未实现 | Phase 3 |
-| GeoIP | `maxmind` + 在线 API | 表与配置已就绪，查询未接线 | Phase 3 |
+| ClickHouse | 支持双写与查询路由 | 已实现双写（`CH_ENABLED=1`）；读路由未接线 | SQLite 仍是唯一权威源；CH 失败不影响主流程 |
+| Surge 网关 | 支持 HTTP 轮询 | 已实现（`/v1/requests/recent` + `/v1/policies*` + `/v1/rules`） | 上游不提供真实落地 IP，属先天限制 |
+| GeoIP | `maxmind` + 在线 API | 已接线 | 纯 Go MMDB 解析，无 CGO |
 | Backend token 返回 | `/api/backends/active` 返回明文 | 全接口统一 `maskToken()` | 修上游泄露 |
 
 ## 测试
@@ -167,4 +193,12 @@ neko-master/                 ← fork，前端不动
 go test ./...
 ```
 
-`internal/collector/tracker_test.go` 覆盖：首次快照不计量、增量做差、连接数只计一次、计数器回退、连接消失清理、零增量跳过、链路拼接、UTC 分桶。
+`internal/collector/tracker_test.go` 覆盖（Clash）：首次快照不计量、增量做差、连接数只计一次、计数器回退、连接消失清理、零增量跳过、链路拼接、UTC 分桶。
+
+`internal/collector/surge_tracker_test.go` 覆盖（Surge）：`startDate` 缺失时首次带字节即计量、preexisting 只建基线不计量、`in/out` 方向映射、连接数只计一次、计数器回退、完成请求防重复计数（无新字节跳过 / 有新字节重新处理）、notes 策略链反转、过期清理、`sourceIP` 传播。
+
+`internal/realtime/realtime_test.go` 覆盖：同分钟同键合并、`Prune` 仅剪旧桶不动未来桶、`Since` 时间过滤、`Overlay` 就地累加 vs 追加新行、不污染入参、多维键隔离、Manager 按 backend 隔离，以及关键的**“落盘后不重复计数”**一致性场景。
+
+`internal/clickhouse/clickhouse_test.go` 覆盖：JSONEachRow 类型精确性（UInt32/UInt64 必须是数字）、引号与控制字符转义、country/agg 列对齐、多行分隔、负值与溢出 clamp、同分钟桶预聚合并、默认禁用。
+
+`internal/gateway/surge_test.go` 覆盖：`parseSurgeRule` 全分支（含 `FINAL`→`MATCH` 类型改写、引号抹除、两段兜底）、策略路径反转与单段忽略、`chains` 兜底与 `DIRECT` 默认、`surgeSourceIP` 回环兜底、`extractHost` 含 IPv6 括号形态、`ResolveTarget` 域名/代理 IP/直连 IP 三种分支。

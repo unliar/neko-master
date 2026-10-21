@@ -5,6 +5,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/unliar/neko-master/neko-master-go/internal/gateway"
 	"github.com/unliar/neko-master/neko-master-go/internal/geo"
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
+	"github.com/unliar/neko-master/neko-master-go/internal/realtime"
 	"github.com/unliar/neko-master/neko-master-go/internal/stats"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
 )
@@ -32,10 +34,24 @@ type Server struct {
 
 // NewServer 创建并注册路由。
 func NewServer(cfg *config.Config, db *store.DB, log *slog.Logger) *Server {
+	return NewServerWithRealtime(cfg, db, log, nil)
+}
+
+// NewServerWithRealtime 创建服务器并接入实时叠加管理器。
+//
+// rt 与 collector.Runner 共用同一份 Manager，才能让 API 看到
+// 采集器刚写入、还没落盘的那部分增量。
+func NewServerWithRealtime(cfg *config.Config, db *store.DB, log *slog.Logger, rt *realtime.Manager) *Server {
+	var svc *stats.Service
+	if rt != nil {
+		svc = stats.NewWithRealtime(db, rt)
+	} else {
+		svc = stats.New(db)
+	}
 	s := &Server{
 		cfg:   cfg,
 		db:    db,
-		stats: stats.New(db),
+		stats: svc,
 		log:   log,
 		mux:   http.NewServeMux(),
 	}
@@ -410,25 +426,41 @@ func (s *Server) handleTrend(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- 网关代理
 
 // gatewayClientFor 为指定 backend 构造网关客户端。
-func (s *Server) gatewayClientFor(id int64) (*gateway.Client, error) {
+//
+// 返回的 type 是标准化后的：clash / surge / agent。
+func (s *Server) gatewayClientFor(id int64) (*gateway.Client, string, error) {
 	be, err := s.stats.GetBackend(id)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return gateway.New(be.URL, be.Token, s.cfg.BackendTLSInsecure), nil
+	return gateway.New(be.URL, be.Token, s.cfg.BackendTLSInsecure), be.Type, nil
 }
 
+// handleGatewayProxies 对应 GET /api/gateway/proxies。
+//
+// Surge 分支（API-DETAILS §2.1.1）：
+//
+//	GET /v1/policies → {proxies, policy-groups}
+//	对每个 group 再 GET /v1/policies/{groupName} 取 detail.policy 作为 now
+//	group 记为 {name, type:Selector, now}，叶子代理记为 {name, type:Unknown}
+//	上游非 2xx → 透传状态码 + {"error":"Surge API error: <status>"}
 func (s *Server) handleGatewayProxies(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolveBackendID(r)
 	if !ok || id == 0 {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
-	c, err := s.gatewayClientFor(id)
+	c, typ, err := s.gatewayClientFor(id)
 	if err != nil {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
+
+	if strings.EqualFold(typ, "surge") {
+		s.handleSurgeProxies(w, r, id)
+		return
+	}
+
 	res, err := c.Proxies(r.Context())
 	if err != nil {
 		s.log.Warn("gateway proxies", "backend", id, "err", err)
@@ -438,17 +470,77 @@ func (s *Server) handleGatewayProxies(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, res)
 }
 
+// handleSurgeProxies 实现 Surge 形态的 proxies 响应。
+func (s *Server) handleSurgeProxies(w http.ResponseWriter, r *http.Request, id int64) {
+	be, err := s.stats.GetBackend(id)
+	if err != nil {
+		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
+		return
+	}
+	sc := gateway.NewSurgeClient(be.URL, be.Token, s.cfg.BackendTLSInsecure)
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+
+	pol, err := sc.Policies(ctx)
+	if err != nil {
+		s.writeErr(w, http.StatusBadGateway, "Surge API error: "+err.Error())
+		return
+	}
+
+	out := map[string]map[string]any{}
+	for _, g := range pol.PolicyGroups {
+		detail, err := sc.PolicyByName(ctx, g)
+		if err != nil {
+			s.log.Warn("surge policy detail", "group", g, "err", err)
+			out[g] = map[string]any{"name": g, "type": "Selector"}
+			continue
+		}
+		out[g] = map[string]any{"name": g, "type": "Selector", "now": detail.Policy}
+	}
+	for _, p := range pol.Proxies {
+		out[p] = map[string]any{"name": p, "type": "Unknown"}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"proxies": out})
+}
+
+// handleGatewayRules 对应 GET /api/gateway/rules。
+//
+// Surge 分支（API-DETAILS §2.1.4）：规则是字符串，
+// 需经 parseSurgeRule 还原成 {type,payload,policy,raw}，
+// 并额外给出 _availablePolicies。
 func (s *Server) handleGatewayRules(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolveBackendID(r)
 	if !ok || id == 0 {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
-	c, err := s.gatewayClientFor(id)
+	c, typ, err := s.gatewayClientFor(id)
 	if err != nil {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
+
+	if strings.EqualFold(typ, "surge") {
+		be, err := s.stats.GetBackend(id)
+		if err != nil {
+			s.writeErr(w, http.StatusNotFound, "No backend specified or active")
+			return
+		}
+		sc := gateway.NewSurgeClient(be.URL, be.Token, s.cfg.BackendTLSInsecure)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		rd, err := sc.Rules(ctx)
+		if err != nil {
+			s.writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{
+			"rules":              rd.Rules,
+			"_availablePolicies": rd.AvailablePolicies,
+		})
+		return
+	}
+
 	res, err := c.Rules(r.Context())
 	if err != nil {
 		s.log.Warn("gateway rules", "backend", id, "err", err)
@@ -458,17 +550,82 @@ func (s *Server) handleGatewayRules(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, res)
 }
 
+// handleGatewayProviders 对应 GET /api/gateway/providers/proxies。
+//
+// Surge 分支（API-DETAILS §2.1.2）：
+//
+//	GET /v1/policies → {proxies, policy-groups}
+//	对每个 group GET /v1/policy_groups/select?group_name=<enc> 取 {policy,type}
+//	注意这里用的端点与 /api/gateway/proxies 不同（风险点 27），
+//	两条路由不能合并。
+//	额外给出 providers["default"] 承载独立代理。
+//	refresh 只识字符串 'true'（风险点 25）。
 func (s *Server) handleGatewayProviders(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolveBackendID(r)
 	if !ok || id == 0 {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
-	c, err := s.gatewayClientFor(id)
+	c, typ, err := s.gatewayClientFor(id)
 	if err != nil {
 		s.writeErr(w, http.StatusNotFound, "No backend specified or active")
 		return
 	}
+
+	if strings.EqualFold(typ, "surge") {
+		be, err := s.stats.GetBackend(id)
+		if err != nil {
+			s.writeErr(w, http.StatusNotFound, "No backend specified or active")
+			return
+		}
+		sc := gateway.NewSurgeClient(be.URL, be.Token, s.cfg.BackendTLSInsecure)
+		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+		defer cancel()
+
+		pol, err := sc.Policies(ctx)
+		if err != nil {
+			s.writeErr(w, http.StatusBadGateway, "Failed to fetch policies: "+err.Error())
+			return
+		}
+
+		// refresh=true 时刷新策略缓存
+		if r.URL.Query().Get("refresh") == "true" {
+			_, _ = s.db.SQL().Exec(`DELETE FROM surge_policy_cache WHERE backend_id = ?`, id)
+		}
+
+		providers := map[string]any{}
+		for _, g := range pol.PolicyGroups {
+			sel, err := sc.SelectPolicyGroup(ctx, g)
+			if err != nil {
+				s.log.Warn("surge select", "group", g, "err", err)
+				continue
+			}
+			providers[g] = map[string]any{
+				"name":    g,
+				"type":    sel.Type,
+				"now":     sel.Policy,
+				"proxies": nil,
+			}
+			_, _ = s.db.SQL().Exec(`
+				INSERT INTO surge_policy_cache (backend_id, policy_group, selected_policy, policy_type)
+				VALUES (?, ?, ?, ?)
+				ON CONFLICT(backend_id, policy_group) DO UPDATE SET
+					selected_policy = excluded.selected_policy,
+					policy_type = excluded.policy_type,
+					updated_at = CURRENT_TIMESTAMP`, id, g, sel.Policy, sel.Type)
+		}
+
+		// 独立代理承载在 providers["default"]
+		defaultList := make([]map[string]any, 0, len(pol.Proxies))
+		for _, p := range pol.Proxies {
+			defaultList = append(defaultList, map[string]any{"name": p, "type": "Unknown"})
+		}
+		providers["default"] = map[string]any{"proxies": defaultList}
+
+		s.writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
+		return
+	}
+
 	res, err := c.Providers(r.Context())
 	if err != nil {
 		s.log.Warn("gateway providers", "backend", id, "err", err)

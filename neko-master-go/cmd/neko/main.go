@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/unliar/neko-master/neko-master-go/internal/api"
+	"github.com/unliar/neko-master/neko-master-go/internal/clickhouse"
 	"github.com/unliar/neko-master/neko-master-go/internal/collector"
 	"github.com/unliar/neko-master/neko-master-go/internal/config"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
@@ -69,8 +70,34 @@ func main() {
 		}
 	}
 
+	// ClickHouse 旁路双写（CH_ENABLED=1 时启用）
+	// 失败策略：CH_REQUIRED=1 则启动失败，否则告警后降级为禁用。
+	var chWriter *clickhouse.Writer
+	if cfg.ClickHouse != nil && cfg.ClickHouse.Enabled {
+		chWriter = clickhouse.NewWriter(cfg.ClickHouse)
+		if err := chWriter.EnsureSchema(); err != nil {
+			if cfg.ClickHouse.Required {
+				log.Error("clickhouse init", "err", err)
+				os.Exit(1)
+			}
+			log.Warn("clickhouse init failed, dual-write disabled", "err", err)
+			chWriter = nil
+		} else {
+			log.Info("clickhouse dual-write enabled", "endpoint", cfg.ClickHouse.BaseURL(),
+				"database", cfg.ClickHouse.Database)
+		}
+	} else {
+		log.Info("clickhouse integration disabled (CH_ENABLED != 1)")
+	}
+	if chWriter != nil {
+		defer chWriter.Close()
+	}
+
 	// 采集调度
 	writer := store.NewWriter(db)
+	if chWriter != nil {
+		writer = store.NewWriterWithClickHouse(db, chWriter)
+	}
 	runner := collector.NewRunner(
 		log,
 		writer,
@@ -87,7 +114,8 @@ func main() {
 	go runner.Start(ctx)
 
 	// HTTP 服务
-	srv := api.NewServer(cfg, db, log)
+	// 与采集器共用同一份 realtime Manager，使 API 能看到尚未落盘的增量
+	srv := api.NewServerWithRealtime(cfg, db, log, runner.Realtime())
 	httpSrv := &http.Server{
 		Addr:              "0.0.0.0:" + cfg.APIPort,
 		Handler:           loggingMiddleware(log, srv.Handler()),

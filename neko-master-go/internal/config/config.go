@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/unliar/neko-master/neko-master-go/internal/clickhouse"
 )
 
 // Config 运行期配置。
@@ -38,6 +40,9 @@ type Config struct {
 
 	// 后端 TLS
 	BackendTLSInsecure bool // BACKEND_TLS_INSECURE=1
+
+	// ClickHouse 旁路（可选数据源，SQLite 仍是唯一权威）
+	ClickHouse *clickhouse.Config
 }
 
 // Load 从环境变量读取配置。
@@ -63,6 +68,8 @@ func Load() *Config {
 		RealtimeMaxMinute: getenvInt("REALTIME_MAX_MINUTES", 180),
 
 		BackendTLSInsecure: getenvBool("BACKEND_TLS_INSECURE", false),
+
+		ClickHouse: clickhouse.LoadConfig(getenv),
 	}
 	return c
 }

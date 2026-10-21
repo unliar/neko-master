@@ -3,11 +3,13 @@ package collector
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/unliar/neko-master/neko-master-go/internal/gateway"
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
+	"github.com/unliar/neko-master/neko-master-go/internal/realtime"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
 )
 
@@ -26,6 +28,7 @@ type Runner struct {
 	flushEvery time.Duration // 刷盘间隔
 	maxBuffer  int
 	insecure   bool
+	realtime   *realtime.Manager
 
 	mu      sync.Mutex
 	workers map[int64]*worker
@@ -35,7 +38,9 @@ type Runner struct {
 type worker struct {
 	target  model.Target
 	tracker *Tracker
+	surge   *SurgeTracker
 	buffer  *Buffer
+	rt      *realtime.Store
 	cancel  context.CancelFunc
 }
 
@@ -56,9 +61,18 @@ func NewRunner(log *slog.Logger, w *store.Writer, src BackendSource,
 		flushEvery: flushEvery,
 		maxBuffer:  maxBuffer,
 		insecure:   insecure,
+		realtime:   realtime.NewManager(cfgRealtimeMinutes),
 		workers:    make(map[int64]*worker),
 	}
 }
+
+// cfgRealtimeMinutes 是 realtime buffer 默认保留的分钟桶数。
+// 真正的值来自 config（REALTIME_MAX_MINUTES），
+// 这里作为新建 Runner 时的默认。
+const cfgRealtimeMinutes = 180
+
+// Realtime 返回实时叠加管理器（供 stats 层使用）。
+func (r *Runner) Realtime() *realtime.Manager { return r.realtime }
 
 // Start 启动调度：定期对账 backend 列表，增删采集协程。
 func (r *Runner) Start(ctx context.Context) {
@@ -107,7 +121,9 @@ func (r *Runner) sync(ctx context.Context) {
 		w := &worker{
 			target:  t,
 			tracker: NewTracker(),
+			surge:   NewSurgeTracker(),
 			buffer:  NewBuffer(id, r.maxBuffer),
+			rt:      r.realtime.Store(id),
 			cancel:  cancel,
 		}
 		r.workers[id] = w
@@ -127,6 +143,7 @@ func (r *Runner) sync(ctx context.Context) {
 				r.log.Error("collector: final flush", "backend", id, "err", err)
 			}
 		}
+		r.realtime.Drop(id)
 		delete(r.workers, id)
 		r.log.Info("collector: stopped", "backend", id)
 	}
@@ -134,6 +151,12 @@ func (r *Runner) sync(ctx context.Context) {
 
 // runWorker 是单个 backend 的采集 + 刷盘循环。
 func (r *Runner) runWorker(ctx context.Context, w *worker) {
+	// Surge 与 Clash 的采集入口、鉴权头、数据形态全不同，分开走。
+	if strings.EqualFold(w.target.Type, "surge") {
+		r.runSurgeWorker(ctx, w)
+		return
+	}
+
 	client := gateway.New(w.target.URL, w.target.Token, r.insecure)
 
 	poll := time.NewTicker(r.interval)
@@ -175,6 +198,62 @@ func (r *Runner) runWorker(ctx context.Context, w *worker) {
 			updates := w.tracker.Diff(resp, now)
 			full := false
 			for _, u := range updates {
+				w.rt.Record(u)
+				if w.buffer.Add(u) {
+					full = true
+				}
+			}
+			if full {
+				r.flushOnce(w)
+			}
+		}
+	}
+}
+
+// runSurgeWorker 是 Surge backend 的采集循环：轮询 /v1/requests/recent。
+//
+// 与 Clash 循环共享退避/缓冲/落盘逻辑，只有取数与做差两步不同。
+func (r *Runner) runSurgeWorker(ctx context.Context, w *worker) {
+	client := gateway.NewSurgeClient(w.target.URL, w.target.Token, r.insecure)
+
+	poll := time.NewTicker(r.interval)
+	defer poll.Stop()
+
+	flush := time.NewTicker(r.flushEvery)
+	defer flush.Stop()
+
+	fails := 0
+	var backoffUntil time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-flush.C:
+			r.flushOnce(w)
+		case <-poll.C:
+			if time.Now().Before(backoffUntil) {
+				continue
+			}
+			now := time.Now()
+			data, err := client.RequestsRecent(ctx)
+			if err != nil {
+				fails++
+				r.log.Warn("collector: surge requests failed",
+					"backend", w.target.ID, "err", err, "fails", fails)
+				backoff := time.Duration(1<<uint(min(fails, 6))) * time.Second
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				backoffUntil = time.Now().Add(backoff)
+				continue
+			}
+			fails = 0
+
+			updates := w.surge.Diff(data, now)
+			full := false
+			for _, u := range updates {
+				w.rt.Record(u)
 				if w.buffer.Add(u) {
 					full = true
 				}
@@ -196,6 +275,8 @@ func (r *Runner) flushOnce(w *worker) {
 		r.log.Error("collector: flush failed", "backend", w.target.ID, "count", len(updates), "err", err)
 		return
 	}
+	// 落盘成功后立即裁剪 realtime buffer，避免与数据库重复计数。
+	w.rt.Prune(time.Now())
 	r.log.Debug("collector: flushed", "backend", w.target.ID, "count", len(updates))
 }
 
@@ -207,7 +288,9 @@ func (r *Runner) stopAll() {
 		w.cancel()
 		if updates := w.buffer.Drain(); len(updates) > 0 {
 			_ = r.writer.Flush(id, updates)
+			w.rt.Prune(time.Now())
 		}
+		r.realtime.Drop(id)
 	}
 	r.workers = make(map[int64]*worker)
 }

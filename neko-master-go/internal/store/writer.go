@@ -6,16 +6,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/unliar/neko-master/neko-master-go/internal/clickhouse"
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
 )
 
 // Writer 负责把内存增量批量落库。
+//
+// SQLite 是唯一权威数据源；ch 为 nil 时（未启用 ClickHouse）
+// 双写是 no-op。即使双写失败也不回滚 SQLite 事务。
 type Writer struct {
 	db *DB
+	ch *clickhouse.Writer
 }
 
 // NewWriter 创建写入器。
 func NewWriter(db *DB) *Writer { return &Writer{db: db} }
+
+// NewWriterWithClickHouse 创建带 ClickHouse 旁路双写的写入器。
+func NewWriterWithClickHouse(db *DB, ch *clickhouse.Writer) *Writer {
+	return &Writer{db: db, ch: ch}
+}
+
+// AttachClickHouse 挂上 ClickHouse 旁路写入器（nil 表示禁用）。
+func (w *Writer) AttachClickHouse(ch *clickhouse.Writer) { w.ch = ch }
+
+// ClickHouse 返回旁路写入器，供健康检查使用。
+func (w *Writer) ClickHouse() *clickhouse.Writer { return w.ch }
 
 // Flush 把一批增量写入所有维度表。
 //
@@ -46,7 +62,13 @@ func (w *Writer) Flush(backendID int64, updates []model.TrafficUpdate) error {
 		return err
 	}
 
-	// 写入后做一次 WAL checkpoint 检查（不强制）
+	// ClickHouse 旁路双写：失败仅计数，绝不影响 SQLite 事务结果。
+	if w.ch != nil {
+		if err := w.ch.WriteTraffic(backendID, updates); err != nil {
+			_ = err // 队列满等错误由 Writer 内部计数
+		}
+	}
+
 	return nil
 }
 
