@@ -449,38 +449,55 @@ func (s *Server) handleRotateAgentToken(w http.ResponseWriter, r *http.Request) 
 
 // ---------------------------------------------------------------- 健康历史
 
+// handleBackendHealthHistory 对应 GET /api/backends/health/history。
+//
+// 对齐上游 backend.controller.ts + backend.service.ts：
+//
+//	query：from / to / backendId（from/to 为 ISO 前 16 位，默认近 24h）
+//	返回：BackendHealthHistory[] —— 按 backend 分组的数组，不是单个对象
+//	      每项含 backendId / backendName / points[]
+//	backendId 解析失败 → 400 {"error":"Invalid backendId"}
+//
+// 前端 api.ts 把结果当成 BackendHealthHistory[] 遍历，
+// 返回单对象会让前端拿不到任何数据。
 func (s *Server) handleBackendHealthHistory(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	idStr := q.Get("backendId")
-	var id int64
-	if idStr != "" {
+
+	fromISO := q.Get("from")
+	if fromISO == "" {
+		fromISO = time.Now().Add(-24 * time.Hour).UTC().Format("2006-01-02T15:04")
+	}
+	toISO := q.Get("to")
+	if toISO == "" {
+		toISO = time.Now().UTC().Format("2006-01-02T15:04")
+	}
+
+	var filterID int64
+	hasFilter := false
+	if idStr := q.Get("backendId"); idStr != "" {
 		v, err := strconv.ParseInt(idStr, 10, 64)
 		if err != nil {
 			s.writeErr(w, http.StatusBadRequest, "Invalid backendId")
 			return
 		}
-		id = v
-	} else {
-		v, err := s.stats.ActiveBackendID()
-		if err != nil {
-			s.writeErr(w, http.StatusNotFound, "No backend specified or active")
-			return
-		}
-		id = v
+		filterID = v
+		hasFilter = true
 	}
 
 	limit := parseLimit(q.Get("limit"), 60, 1440)
 
-	rows, err := s.db.SQL().Query(`
-		SELECT minute, status, latency_ms, server_latency_ms, message
-		FROM backend_health_logs
-		WHERE backend_id = ?
-		ORDER BY minute DESC LIMIT ?`, id, limit)
-	if err != nil {
-		s.writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+	// backend id -> name，缺失时落到 "Backend <id>"
+	nameByID := map[int64]string{}
+	if rows, err := s.db.SQL().Query(`SELECT id, name FROM backend_configs`); err == nil {
+		for rows.Next() {
+			var id int64
+			var name string
+			if err := rows.Scan(&id, &name); err == nil {
+				nameByID[id] = name
+			}
+		}
+		rows.Close()
 	}
-	defer rows.Close()
 
 	type point struct {
 		Time          string  `json:"time"`
@@ -489,15 +506,62 @@ func (s *Server) handleBackendHealthHistory(w http.ResponseWriter, r *http.Reque
 		ServerLatency *int64  `json:"server_latency_ms"`
 		Message       *string `json:"message"`
 	}
-	pts := []point{}
+	grouped := map[int64]*struct {
+		BackendID   int64   `json:"backendId"`
+		BackendName string  `json:"backendName"`
+		Points      []point `json:"points"`
+	}{}
+	order := []int64{}
+
+	var query string
+	args := []any{fromISO, toISO}
+	if hasFilter {
+		query = `
+			SELECT backend_id, minute, status, latency_ms, server_latency_ms, message
+			FROM backend_health_logs
+			WHERE backend_id = ? AND minute >= ? AND minute <= ?
+			ORDER BY minute DESC LIMIT ?`
+		args = append([]any{filterID}, args...)
+		args = append(args, limit)
+	} else {
+		query = `
+			SELECT backend_id, minute, status, latency_ms, server_latency_ms, message
+			FROM backend_health_logs
+			WHERE minute >= ? AND minute <= ?
+			ORDER BY minute DESC LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.SQL().Query(query, args...)
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
 	for rows.Next() {
-		var p point
+		var beID int64
+		var minute, status string
 		var lat, srv sql.NullInt64
 		var msg sql.NullString
-		if err := rows.Scan(&p.Time, &p.Status, &lat, &srv, &msg); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, err.Error())
-			return
+		if err := rows.Scan(&beID, &minute, &status, &lat, &srv, &msg); err != nil {
+			continue
 		}
+		g, ok := grouped[beID]
+		if !ok {
+			name := nameByID[beID]
+			if name == "" {
+				name = "Backend " + strconv.FormatInt(beID, 10)
+			}
+			g = &struct {
+				BackendID   int64   `json:"backendId"`
+				BackendName string  `json:"backendName"`
+				Points      []point `json:"points"`
+			}{BackendID: beID, BackendName: name, Points: []point{}}
+			grouped[beID] = g
+			order = append(order, beID)
+		}
+		p := point{Time: minute, Status: status}
 		if lat.Valid {
 			p.LatencyMS = &lat.Int64
 		}
@@ -507,17 +571,14 @@ func (s *Server) handleBackendHealthHistory(w http.ResponseWriter, r *http.Reque
 		if msg.Valid {
 			p.Message = &msg.String
 		}
-		pts = append(pts, p)
+		g.Points = append(g.Points, p)
 	}
 
-	var name string
-	_ = s.db.SQL().QueryRow(`SELECT name FROM backend_configs WHERE id = ?`, id).Scan(&name)
-
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"backendId":   id,
-		"backendName": name,
-		"points":      pts,
-	})
+	out := make([]any, 0, len(order))
+	for _, id := range order {
+		out = append(out, grouped[id])
+	}
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // ---------------------------------------------------------------- 工具

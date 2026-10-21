@@ -534,8 +534,22 @@ func (s *Server) handleGatewayRules(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		// 字段名对齐上游 app.ts 的 Surge 分支：parseSurgeRule 给出 policy，
+		// 但响应里改名为 proxy 并固定 size: 0。
+		// 前端 interactive-rule-stats.tsx 硬读 rule.proxy，否则拿不到代理组名，
+		// Surge 的零流量规则会被全部过滤掉。
+		out := make([]map[string]any, 0, len(rd.Rules))
+		for _, r := range rd.Rules {
+			out = append(out, map[string]any{
+				"type":    r.Type,
+				"payload": r.Payload,
+				"proxy":   r.Policy,
+				"size":    0,
+			})
+		}
 		s.writeJSON(w, http.StatusOK, map[string]any{
-			"rules":              rd.Rules,
+			"rules":              out,
+			"_source":            "surge",
 			"_availablePolicies": rd.AvailablePolicies,
 		})
 		return
