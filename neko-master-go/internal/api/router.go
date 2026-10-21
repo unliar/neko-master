@@ -14,6 +14,7 @@ import (
 
 	"github.com/unliar/neko-master/neko-master-go/internal/config"
 	"github.com/unliar/neko-master/neko-master-go/internal/gateway"
+	"github.com/unliar/neko-master/neko-master-go/internal/geo"
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
 	"github.com/unliar/neko-master/neko-master-go/internal/stats"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
@@ -24,6 +25,7 @@ type Server struct {
 	cfg   *config.Config
 	db    *store.DB
 	stats *stats.Service
+	geo   *geo.Lookup
 	log   *slog.Logger
 	mux   *http.ServeMux
 }
@@ -37,6 +39,7 @@ func NewServer(cfg *config.Config, db *store.DB, log *slog.Logger) *Server {
 		log:   log,
 		mux:   http.NewServeMux(),
 	}
+	s.geo = geo.New(s.geoProvider(), s.geoAPIURL(), cfg.GeoMMDBDir, db.SQL(), log)
 	s.routes()
 	return s
 }
@@ -95,6 +98,10 @@ func (s *Server) routes() {
 
 	// Surge 专用：刷新 provider
 	s.mux.HandleFunc("POST /api/gateway/providers/proxies/refresh", s.handleProviderRefresh)
+
+	// GeoIP 诊断（只读，上游无此路由）
+	s.mux.HandleFunc("GET /api/db/geoip/status", s.handleGeoStatus)
+	s.mux.HandleFunc("GET /api/db/geoip/lookup", s.handleGeoLookup)
 
 	// 前端静态资源（若 web/out 存在）
 	s.mountStatic()
@@ -193,6 +200,24 @@ func (s *Server) getTimeRange(r *http.Request) (time.Time, time.Time, bool, stri
 	return start, end, true, ""
 }
 
+// geoProvider 读 GeoIP 数据源，回落到环境变量默认值。
+func (s *Server) geoProvider() string {
+	var v string
+	if err := s.db.SQL().QueryRow(`SELECT value FROM app_config WHERE key = 'geoip.lookup_provider'`).Scan(&v); err == nil && v != "" {
+		return v
+	}
+	return s.cfg.GeoLookupProvider
+}
+
+// geoAPIURL 读在线查 IP 的接口地址。
+func (s *Server) geoAPIURL() string {
+	var v string
+	if err := s.db.SQL().QueryRow(`SELECT value FROM app_config WHERE key = 'geoip.online_api_url'`).Scan(&v); err == nil && v != "" {
+		return v
+	}
+	return s.cfg.GeoOnlineAPIURL
+}
+
 // ---------------------------------------------------------------- 时间工具
 
 var (
@@ -270,7 +295,7 @@ func (s *Server) handleIPs(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 func (s *Server) handleProxies(w http.ResponseWriter, r *http.Request) {

@@ -147,7 +147,7 @@ func (s *Server) handleDomainIPDetails(w http.ResponseWriter, r *http.Request, i
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 func (s *Server) handleIPProxyStats(w http.ResponseWriter, r *http.Request, id int64, ip string) {
@@ -171,7 +171,7 @@ func (s *Server) handleIPDomainDetails(w http.ResponseWriter, r *http.Request, i
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 func (s *Server) handleProxyDomains(w http.ResponseWriter, r *http.Request, id int64, chain string) {
@@ -193,7 +193,7 @@ func (s *Server) handleProxyIPs(w http.ResponseWriter, r *http.Request, id int64
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 func (s *Server) handleRuleDomains(w http.ResponseWriter, r *http.Request, id int64, rule string) {
@@ -215,7 +215,7 @@ func (s *Server) handleRuleIPs(w http.ResponseWriter, r *http.Request, id int64,
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 func (s *Server) handleRuleDomainProxyStats(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +333,7 @@ func (s *Server) handleDeviceIPs(w http.ResponseWriter, r *http.Request, id int6
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
 }
 
 // handleTrendAggregated 对应 GET /api/stats/trend/aggregated。

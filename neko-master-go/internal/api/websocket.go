@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/unliar/neko-master/neko-master-go/internal/model"
+	"github.com/unliar/neko-master/neko-master-go/internal/stats"
 )
 
 // 说明：这里手写最小可用的 WebSocket 服务端（RFC 6455 文本帧），
@@ -217,7 +218,10 @@ func (c *wsConn) Close() error {
 	return c.conn.Close()
 }
 
-// wsMessage 是客户端 → 服务端的消息（只保留实现用到的字段）。
+// wsMessage 是客户端 → 服务端的消息。
+//
+// 字段与上游 websocket.server.ts 内联版一致；
+// 特别注意 ipsPageSortBy 是 string（上游 types 文件里写成 number 是笔误）。
 type wsMessage struct {
 	Type                string   `json:"type"`
 	BackendID           *int64   `json:"backendId"`
@@ -231,35 +235,58 @@ type wsMessage struct {
 	TrendBucketMinutes  *int     `json:"trendBucketMinutes"`
 	IncludeDeviceDetail *bool    `json:"includeDeviceDetails"`
 	DeviceSourceIP      string   `json:"deviceSourceIP"`
+	DeviceDetailLimit   *int     `json:"deviceDetailLimit"`
 	IncludeProxyDetails *bool    `json:"includeProxyDetails"`
 	ProxyChain          string   `json:"proxyChain"`
+	ProxyDetailLimit    *int     `json:"proxyDetailLimit"`
 	IncludeRuleDetails  *bool    `json:"includeRuleDetails"`
 	RuleName            string   `json:"ruleName"`
+	RuleDetailLimit     *int     `json:"ruleDetailLimit"`
 	IncludeRuleChain    *bool    `json:"includeRuleChainFlow"`
-	IncludeDomainsPage  *bool    `json:"includeDomainsPage"`
-	IncludeIPsPage      *bool    `json:"includeIPsPage"`
-	IncludeLiveConns    *bool    `json:"includeLiveConnections"`
+
+	IncludeDomainsPage   *bool   `json:"includeDomainsPage"`
+	DomainsPageOffset    *int    `json:"domainsPageOffset"`
+	DomainsPageLimit     *int    `json:"domainsPageLimit"`
+	DomainsPageSortBy    *string `json:"domainsPageSortBy"`
+	DomainsPageSortOrder *string `json:"domainsPageSortOrder"`
+	DomainsPageSearch    *string `json:"domainsPageSearch"`
+
+	IncludeIPsPage   *bool   `json:"includeIPsPage"`
+	IPsPageOffset    *int    `json:"ipsPageOffset"`
+	IPsPageLimit     *int    `json:"ipsPageLimit"`
+	IPsPageSortBy    *string `json:"ipsPageSortBy"`
+	IPsPageSortOrder *string `json:"ipsPageSortOrder"`
+	IPsPageSearch    *string `json:"ipsPageSearch"`
 }
 
 // wsSubscription 记录一条连接的订阅状态。
 type wsSubscription struct {
-	backendID     int64
-	start         *time.Time
-	end           *time.Time
-	minInterval   time.Duration
-	includeSumm   bool
-	includeTrend  bool
-	trendMinutes  int
-	includeDev    bool
-	deviceSource  string
-	includeProxy  bool
-	proxyChain    string
-	includeRule   bool
-	ruleName      string
-	includeDomPag bool
-	includeIPsPag bool
-	lastPush      time.Time
-	lastSig       string
+	backendID    int64
+	start        *time.Time
+	end          *time.Time
+	minInterval  time.Duration
+	includeSumm  bool
+	includeTrend bool
+	trendMinutes int
+	trendBucket  int
+	includeDev   bool
+	deviceSource string
+	deviceLimit  int
+	includeProxy bool
+	proxyChain   string
+	proxyLimit   int
+	includeRule  bool
+	ruleName     string
+	ruleLimit    int
+	includeChain bool
+
+	hasDomPage bool
+	domPage    stats.PageParams
+	hasIPsPage bool
+	ipsPage    stats.PageParams
+
+	lastPush time.Time
+	lastSig  string
 }
 
 func newSubscription() *wsSubscription {
@@ -268,12 +295,15 @@ func newSubscription() *wsSubscription {
 		includeSumm:  true,
 		includeTrend: true,
 		trendMinutes: 30,
+		trendBucket:  1,
+		deviceLimit:  5000,
+		proxyLimit:   5000,
+		ruleLimit:    5000,
 	}
 }
 
 // handleWS 处理 /ws 升级与消息循环。
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	// 鉴权：若开启了访问控制，校验 token（query 或 cookie）
 	if !s.wsAuthorized(r) {
 		s.writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -290,7 +320,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 
-	// 读循环放在独立 goroutine，通过 channel 传递消息
 	msgs := make(chan *wsFrame, 8)
 	errCh := make(chan error, 1)
 	go func() {
@@ -333,7 +362,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if m.Type == "subscribe" {
-					// 立即推一次
 					sub.lastSig = ""
 					s.pushStats(c, sub)
 				}
@@ -356,7 +384,7 @@ func (s *Server) wsAuthorized(r *http.Request) bool {
 	}
 	tok := r.URL.Query().Get("token")
 	if tok == "" {
-		if ck, err := r.Cookie("neko-session"); err == nil {
+		if ck, err := r.Cookie(sessionCookie); err == nil {
 			tok = ck.Value
 		}
 	}
@@ -376,7 +404,7 @@ func (s *Server) applyWSMessage(sub *wsSubscription, m *wsMessage) {
 		}
 	}
 
-	// start/end：两者都给且合法才更新
+	// start/end：两者都给且合法才更新；都为空表示全量
 	if m.Start != "" && m.End != "" {
 		st, err1 := time.Parse(time.RFC3339, m.Start)
 		en, err2 := time.Parse(time.RFC3339, m.End)
@@ -409,35 +437,113 @@ func (s *Server) applyWSMessage(sub *wsSubscription, m *wsMessage) {
 		if v <= 0 {
 			v = 30
 		}
-		max := 30 * 24 * 60
-		if v > max {
-			v = max
+		if v > 30*24*60 {
+			v = 30 * 24 * 60
 		}
 		sub.trendMinutes = v
 	}
+	if m.TrendBucketMinutes != nil {
+		v := *m.TrendBucketMinutes
+		if v <= 0 {
+			v = 1
+		}
+		if v > 24*60 {
+			v = 24 * 60
+		}
+		sub.trendBucket = v
+	}
+
+	// 设备下钻
 	if m.IncludeDeviceDetail != nil {
-		sub.includeDev = *m.IncludeDeviceDetail
+		if !*m.IncludeDeviceDetail {
+			sub.includeDev = false
+		} else if m.DeviceSourceIP != "" {
+			sub.includeDev = true
+			sub.deviceSource = m.DeviceSourceIP
+		}
 	}
 	if m.DeviceSourceIP != "" {
 		sub.deviceSource = m.DeviceSourceIP
 	}
+	if m.DeviceDetailLimit != nil {
+		v := *m.DeviceDetailLimit
+		if v > 20000 {
+			v = 20000
+		}
+		if v <= 0 {
+			v = 5000
+		}
+		sub.deviceLimit = v
+	}
+
+	// 代理下钻
 	if m.IncludeProxyDetails != nil {
-		sub.includeProxy = *m.IncludeProxyDetails
+		if !*m.IncludeProxyDetails {
+			sub.includeProxy = false
+		} else if m.ProxyChain != "" {
+			sub.includeProxy = true
+			sub.proxyChain = m.ProxyChain
+		}
 	}
 	if m.ProxyChain != "" {
 		sub.proxyChain = m.ProxyChain
 	}
+	if m.ProxyDetailLimit != nil {
+		v := *m.ProxyDetailLimit
+		if v > 20000 {
+			v = 20000
+		}
+		if v <= 0 {
+			v = 5000
+		}
+		sub.proxyLimit = v
+	}
+
+	// 规则下钻
 	if m.IncludeRuleDetails != nil {
-		sub.includeRule = *m.IncludeRuleDetails
+		if !*m.IncludeRuleDetails {
+			sub.includeRule = false
+		} else if m.RuleName != "" {
+			sub.includeRule = true
+			sub.ruleName = m.RuleName
+		}
 	}
 	if m.RuleName != "" {
 		sub.ruleName = m.RuleName
 	}
-	if m.IncludeDomainsPage != nil {
-		sub.includeDomPag = *m.IncludeDomainsPage
+	if m.RuleDetailLimit != nil {
+		v := *m.RuleDetailLimit
+		if v > 20000 {
+			v = 20000
+		}
+		if v <= 0 {
+			v = 5000
+		}
+		sub.ruleLimit = v
 	}
-	if m.IncludeIPsPage != nil {
-		sub.includeIPsPag = *m.IncludeIPsPage
+	if m.IncludeRuleChain != nil {
+		sub.includeChain = *m.IncludeRuleChain
+	}
+
+	// 分页：任一参数非法则整个 page 设置被忽略（不应用也不清空）
+	if m.IncludeDomainsPage != nil && *m.IncludeDomainsPage {
+		if p, ok := stats.NormDomainPage(m.DomainsPageOffset, m.DomainsPageLimit,
+			m.DomainsPageSortBy, m.DomainsPageSortOrder, m.DomainsPageSearch); ok {
+			sub.hasDomPage = true
+			sub.domPage = p
+		}
+	} else if m.IncludeDomainsPage != nil && !*m.IncludeDomainsPage {
+		sub.hasDomPage = false
+	}
+
+	if m.IncludeIPsPage != nil && *m.IncludeIPsPage {
+		if p, ok := stats.NormIPPage(m.IPsPageOffset, m.IPsPageLimit,
+			m.IPsPageSortBy, m.IPsPageSortOrder, m.IPsPageSearch); ok {
+			sub.hasIPsPage = true
+			sub.ipsPage = p
+		}
+	} else if m.IncludeIPsPage != nil && !*m.IncludeIPsPage {
+		sub.hasIPsPage = false
 	}
 }
 
@@ -450,15 +556,13 @@ func (s *Server) pushStats(c *wsConn, sub *wsSubscription) {
 		return
 	}
 
-	data, err := s.buildStatsSummary(sub)
+	data, sig, err := s.buildStatsSummary(sub)
 	if err != nil {
 		s.log.Warn("ws build summary", "backend", sub.backendID, "err", err)
 		return
 	}
 
 	// 内容签名：无变化不推（对应上游 subscribeNoop）
-	sig := fmt.Sprintf("%d|%d|%d|%d|%d", data.TotalUpload, data.TotalDownload,
-		data.TotalConnections, data.TopDomainCount, data.RuleStatCount)
 	if sig == sub.lastSig {
 		return
 	}
@@ -489,27 +593,189 @@ func (s *Server) pushStats(c *wsConn, sub *wsSubscription) {
 	}
 }
 
-// buildStatsSummary 组装 WS 推送用的 StatsSummary。
-func (s *Server) buildStatsSummary(sub *wsSubscription) (*model.StatsSummary, error) {
+// buildStatsSummary 按订阅参数组装完整 StatsSummary，同时返回变更签名。
+func (s *Server) buildStatsSummary(sub *wsSubscription) (*model.StatsSummary, string, error) {
+	out := &model.StatsSummary{}
+
 	sum, err := s.stats.Summary(sub.backendID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	out := &model.StatsSummary{
-		TotalConnections: sum.TotalConnections,
-		TotalUpload:      sum.TotalUpload,
-		TotalDownload:    sum.TotalDownload,
-		TotalDomains:     sum.TotalDomains,
-		TotalIPs:         sum.TotalIPs,
-		TotalRules:       sum.TotalRules,
-		TotalProxies:     sum.TotalProxies,
-		TopDomains:       sum.TopDomains,
-		TopIPs:           sum.TopIPs,
-		ProxyStats:       sum.ProxyStats,
-		RuleStats:        sum.RuleStats,
-		HourlyStats:      sum.HourlyStats,
+	out.TotalUpload = sum.TotalUpload
+	out.TotalDownload = sum.TotalDownload
+	out.TotalConnections = sum.TotalConnections
+	out.TotalDomains = sum.TotalDomains
+	out.TotalIPs = sum.TotalIPs
+	out.TotalProxies = sum.TotalProxies
+
+	need := func(k string) bool { return true } // Phase 1 简化：全量下发
+
+	_ = need
+
+	if sum.TotalRules > 0 {
+		v := sum.TotalRules
+		out.TotalRules = &v
 	}
+	if sum.TodayUpload > 0 {
+		v := sum.TodayUpload
+		out.TodayUpload = &v
+	}
+	if sum.TodayDownload > 0 {
+		v := sum.TodayDownload
+		out.TodayDownload = &v
+	}
+
+	out.TopDomains = toAnySlice(sum.TopDomains)
+	out.TopIPs = s.attachGeoIPs(toAnySlice(sum.TopIPs))
+	out.ProxyStats = toAnySlice(sum.ProxyStats)
+	out.RuleStats = toAnySlice(sum.RuleStats)
+	out.HourlyStats = toAnySlice(sum.HourlyStats)
+
 	out.TopDomainCount = len(sum.TopDomains)
 	out.RuleStatCount = len(sum.RuleStats)
-	return out, nil
+
+	if cs, err := s.stats.Countries(sub.backendID, 50, 0); err == nil && len(cs) > 0 {
+		out.CountryStats = toAnySlice(cs)
+	}
+	if ds, err := s.stats.Devices(sub.backendID, 50, 0); err == nil && len(ds) > 0 {
+		out.DeviceStats = toAnySlice(ds)
+	}
+
+	// 趋势
+	if sub.includeTrend {
+		if pts, err := s.stats.TrendAggregated(sub.backendID, sub.trendMinutes, sub.trendBucket, 0, nil, nil); err == nil && len(pts) > 0 {
+			out.TrendStats = pts
+		}
+	}
+
+	// 设备下钻
+	if sub.includeDev && sub.deviceSource != "" {
+		src := sub.deviceSource
+		out.DeviceDetailSourceIP = &src
+		if doms, err := s.stats.DeviceDomains(sub.backendID, src, sub.deviceLimit); err == nil {
+			out.DeviceDomains = toAnySlice(doms)
+		}
+		if ips, err := s.stats.DeviceIPs(sub.backendID, src, sub.deviceLimit); err == nil {
+			out.DeviceIPs = s.attachGeoIPs(toAnySlice(ips))
+		}
+	}
+
+	// 代理下钻
+	if sub.includeProxy && sub.proxyChain != "" {
+		ch := sub.proxyChain
+		out.ProxyDetailChain = &ch
+		if doms, err := s.stats.ProxyDomains(sub.backendID, ch, sub.proxyLimit); err == nil {
+			out.ProxyDomains = toAnySlice(doms)
+		}
+		if ips, err := s.stats.ProxyIPs(sub.backendID, ch, sub.proxyLimit); err == nil {
+			out.ProxyIPs = s.attachGeoIPs(toAnySlice(ips))
+		}
+	}
+
+	// 规则下钻
+	if sub.includeRule && sub.ruleName != "" {
+		rn := sub.ruleName
+		out.RuleDetailName = &rn
+		if doms, err := s.stats.RuleDomains(sub.backendID, rn, sub.ruleLimit); err == nil {
+			out.RuleDomains = toAnySlice(doms)
+		}
+		if ips, err := s.stats.RuleIPs(sub.backendID, rn, sub.ruleLimit); err == nil {
+			out.RuleIPs = s.attachGeoIPs(toAnySlice(ips))
+		}
+	}
+
+	// 分页
+	if sub.hasDomPage {
+		if res, err := s.stats.DomainsPage(sub.backendID, sub.domPage); err == nil {
+			out.DomainsPage = &model.PageResult{Data: s.attachGeoIPs(res.Data), Total: res.Total}
+			q := sub.domPage
+			order := q.SortOrder
+			by := reverseSortKey(q.SortBy)
+			out.DomainsPageQuery = &model.PageQuery{
+				Offset: q.Offset, Limit: q.Limit,
+				SortBy: by, SortOrder: order, Search: q.Search,
+			}
+		}
+	}
+	if sub.hasIPsPage {
+		if res, err := s.stats.IPsPage(sub.backendID, sub.ipsPage); err == nil {
+			out.IPsPage = &model.PageResult{Data: s.attachGeoIPs(res.Data), Total: res.Total}
+			q := sub.ipsPage
+			out.IPsPageQuery = &model.PageQuery{
+				Offset: q.Offset, Limit: q.Limit,
+				SortBy: reverseSortKey(q.SortBy), SortOrder: q.SortOrder, Search: q.Search,
+			}
+		}
+	}
+
+	sig := fmt.Sprintf("%d|%d|%d|%d|%d|%d|%d|%v|%v|%d|%d|%v",
+		out.TotalUpload, out.TotalDownload, out.TotalConnections,
+		len(out.CountryStats), len(out.DeviceStats), len(out.TrendStats),
+		out.TopDomainCount,
+		sub.includeDev, sub.includeProxy, sub.ruleLimit,
+		pageTotal(out.DomainsPage), pageTotal(out.IPsPage))
+
+	return out, sig, nil
+}
+
+// attachGeoIPs 给一组 IP 记录补 GeoIP。
+//
+// 传入元素是 stats.IPRow 结构体而非 map，必须先序列化再附加字段；
+// 直接断言 map[string]any 会永远失败，表现为「geoIP 一个都不出现」。
+func (s *Server) attachGeoIPs(rows []any) []any {
+	if s.geo == nil || len(rows) == 0 {
+		return rows
+	}
+	for i, r := range rows {
+		b, err := json.Marshal(r)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			continue
+		}
+		ip, _ := m["ip"].(string)
+		if ip == "" {
+			continue
+		}
+		if info := s.geo.IP(ip); info != nil {
+			m["geoIP"] = info
+		}
+		rows[i] = m
+	}
+	return rows
+}
+
+func pageTotal(p *model.PageResult) int {
+	if p == nil {
+		return -1
+	}
+	return p.Total
+}
+
+func toAnySlice[T any](in []T) []any {
+	out := make([]any, len(in))
+	for i, v := range in {
+		out[i] = v
+	}
+	return out
+}
+
+// reverseSortKey 把 DB 列名映射回前端用的 key。
+func reverseSortKey(col string) string {
+	switch col {
+	case "total_upload":
+		return "upload"
+	case "total_download":
+		return "download"
+	case "(total_upload + total_download)":
+		return "traffic"
+	case "total_connections":
+		return "conns"
+	case "last_seen":
+		return "lastSeen"
+	default:
+		return col
+	}
 }

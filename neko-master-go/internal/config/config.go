@@ -51,7 +51,7 @@ func Load() *Config {
 		LogLevel: strings.ToLower(getenv("LOG_LEVEL", "info")),
 
 		GeoLookupProvider: getenv("GEOIP_LOOKUP_PROVIDER", "online"),
-		GeoOnlineAPIURL:   getenv("GEOIP_ONLINE_API_URL", "https://api.ipinfo.es/ipinfo"),
+		GeoOnlineAPIURL:   getenv("GEOIP_ONLINE_API_URL", "https://ipwho.is"),
 		GeoMMDBDir:        getenv("GEOIP_MMDB_DIR", "./data/geoip"),
 
 		CookieSecret:          getenv("COOKIE_SECRET", ""),

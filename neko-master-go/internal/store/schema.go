@@ -409,7 +409,7 @@ var defaultConfig = []string{
     ('retention.hourly_stats_days', '30'),
     ('retention.auto_cleanup', '1'),
     ('geoip.lookup_provider', 'online'),
-    ('geoip.online_api_url', 'https://api.ipinfo.es/ipinfo');`,
+    ('geoip.online_api_url', 'https://ipwho.is');`,
 	`INSERT OR IGNORE INTO auth_config (key, value) VALUES
     ('enabled', '0'),
     ('token_hash', '');`,
