@@ -70,6 +70,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/backends/active", s.handleBackendActive)
 	s.mux.HandleFunc("GET /api/backends/listening", s.handleBackendListening)
 
+	// 下钻接口（详情页必用）
+	s.registerDrilldown()
+
 	// 前端静态资源（若 web/out 存在）
 	s.mountStatic()
 }
@@ -166,6 +169,13 @@ func (s *Server) getTimeRange(r *http.Request) (time.Time, time.Time, bool, stri
 	}
 	return start, end, true, ""
 }
+
+// ---------------------------------------------------------------- 时间工具
+
+var (
+	nowFunc = time.Now
+	hourDur = time.Hour
+)
 
 // ---------------------------------------------------------------- handlers
 

@@ -27,9 +27,9 @@ type Config struct {
 	GeoMMDBDir        string // geoip MMDB 所在目录
 
 	// 鉴权
-	CookieSecret            string // COOKIE_SECRET
-	ForceAccessControlOff   bool   // FORCE_ACCESS_CONTROL_OFF
-	ShowcaseSiteMode        bool   // SHOWCASE_SITE_MODE
+	CookieSecret          string // COOKIE_SECRET
+	ForceAccessControlOff bool   // FORCE_ACCESS_CONTROL_OFF
+	ShowcaseSiteMode      bool   // SHOWCASE_SITE_MODE
 
 	// 采集调优
 	FlushIntervalMS   int // FLUSH_INTERVAL_MS，默认 30000

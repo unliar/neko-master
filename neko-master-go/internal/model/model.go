@@ -9,7 +9,7 @@ type Backend struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
 	URL       string `json:"url"`
-	Token     string `json:"-"` // 绝不外泄
+	Token     string `json:"-"`    // 绝不外泄
 	Type      string `json:"type"` // clash | surge | agent
 	Enabled   bool   `json:"enabled"`
 	IsActive  bool   `json:"isActive"`
@@ -111,14 +111,14 @@ type Summary struct {
 
 // Connection 是上游 Mihomo /connections 返回的连接条目（只保留用到的字段）。
 type Connection struct {
-	ID       string            `json:"id"`
-	Metadata ConnectionMetadata `json:"metadata"`
-	Upload   int64             `json:"upload"`
-	Download int64             `json:"download"`
-	Chains   []string          `json:"chains"`
-	Rule     string            `json:"rule"`
-	RulePayload string         `json:"rulePayload"`
-	Start    string            `json:"start"`
+	ID          string             `json:"id"`
+	Metadata    ConnectionMetadata `json:"metadata"`
+	Upload      int64              `json:"upload"`
+	Download    int64              `json:"download"`
+	Chains      []string           `json:"chains"`
+	Rule        string             `json:"rule"`
+	RulePayload string             `json:"rulePayload"`
+	Start       string             `json:"start"`
 }
 
 // ConnectionMetadata 连接元数据。
