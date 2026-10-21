@@ -174,6 +174,90 @@ neko-master/                 ← fork，前端不动
 
 **只新增 `neko-master-go/` 目录**，不改动 `apps/` 与 `packages/`。这样上游更新时 `git merge upstream/main` 不会冲突，Go 后端按 `API-DETAILS.md` 契约补齐即可。
 
+## 前端接口核对
+
+本节记录与 `apps/web` 前端的接口核对结果，便于后续继续核对。
+核对方式：抓取前端 `lib/api.ts` 的 39 条 `buildUrl` 路径 + 4 条裸 `fetch`
+（`auth/state`、`auth/verify`、`auth/logout`、`backends`），与 Go 侧
+`mux.HandleFunc` 注册表逐条比对，再逐个核对查询参数与返回字段。
+
+**结论：路径层面对齐，零缺失；参数与返回结构已修复 2 处不匹配。**
+
+### 路径清单（39 + 4 = 43，全部有实现）
+
+```
+GET  /api/stats/summary                  GET  /api/stats/domains
+GET  /api/stats/ips                      GET  /api/stats/proxies
+GET  /api/stats/rules                    GET  /api/stats/countries
+GET  /api/stats/devices                  GET  /api/stats/trend/aggregated
+GET  /api/stats/domains/proxy-stats      GET  /api/stats/domains/ip-details
+GET  /api/stats/ips/proxy-stats          GET  /api/stats/ips/domain-details
+GET  /api/stats/proxies/domains          GET  /api/stats/proxies/ips
+GET  /api/stats/devices/domains          GET  /api/stats/devices/ips
+GET  /api/stats/rules/domains            GET  /api/stats/rules/ips
+GET  /api/stats/rules/chain-flow-all     GET  /api/stats/rules/domains/proxy-stats
+GET  /api/stats/rules/domains/ip-details GET  /api/stats/rules/ips/proxy-stats
+GET  /api/stats/rules/ips/domain-details
+GET  /api/gateway/proxies                GET  /api/gateway/rules
+GET  /api/gateway/providers/proxies      GET  /api/backends/health/history
+GET  /api/db/geoip                       GET  /api/db/retention
+GET  /api/db/stats                       POST /api/db/cleanup
+GET  /api/auth/state                     POST /api/auth/enable
+POST /api/auth/disable                   POST /api/auth/verify
+PUT  /api/auth/token                     POST /api/backends/test
+GET  /api/backends                       POST /api/backends
+PUT  /api/backends/{id}                  DELETE /api/backends/{id}
+```
+
+后端另有前端不直接调用的路由：`/api/agent/*`（agent 反向上报）、
+`/api/stats/global`、`/api/stats/hourly`、`/api/stats/trend`、
+`/api/stats/rule-proxy-map`、`/api/stats/rules/chain-flow`、
+`/api/stats/connections`、`/api/db/vacuum`、`/api/db/geoip/lookup`、
+`/api/db/geoip/status`、`/api/gateway/providers/proxies/refresh`、
+`/api/backends/active`、`/api/backends/listening`、
+`/api/backends/{id}/{activate,listening,clear-data,rotate-agent-token,test}`。
+其中 backends 的 CRUD 子路由是前端通过路径模板拼接调用的，非缺失。
+
+### 已核验一致（未改动）
+
+| 项 | 状态 |
+|---|---|
+| 路径覆盖 | 43/43 全部有实现，零缺失 |
+| `DomainRow` / `DomainStats` | 8 字段逐字段一致 |
+| `IPRow` / `IPStats` | 一致；`geoIP` 由 `attachGeoIPs` 动态附加（非结构体字段） |
+| `ProxyRow` / `RuleRow` / `DeviceRow` / `CountryRow` / `HourlyRow` | 字段一致 |
+| `TrendPoint` / `TrafficTrendPoint` | `time` / `upload` / `download` 一致 |
+| auth 四接口 | 请求体（`{token}`、`{currentToken,newToken}`）与返回结构一致 |
+| `Backend` 结构 | 与前端接口一致，token 统一掩码 |
+
+### 已修复的不匹配
+
+| 接口 | 问题 | 修复 |
+|---|---|---|
+| `GET /api/gateway/rules`（Surge） | 返回 `policy`，前端 `interactive-rule-stats.tsx` 硬读 `rule.proxy`，导致 Surge 零流量规则被 `if (!proxyGroup) continue` 全部过滤 | 返回时改名 `proxy` 并固定 `size: 0`，补 `_source: 'surge'`（对齐上游 `app.ts`） |
+| `GET /api/backends/health/history` | 返回单个对象且读错参数；前端要 `BackendHealthHistory[]` 数组并传 `from`/`to` | 改为按 backend 分组的数组，读 `from`/`to`/`backendId`，缺省近 24h，`backendId` 解析失败返回 400 |
+
+### 风险点 / 待继续核对
+
+1. **`geoIP` 字段来源不一致**：前端 `IPStats` 声明了 `geoIP`，但 Go 侧
+   `IPRow` 结构体没有该字段，靠 `attachGeoIPs` 序列化后动态附加。
+   功能正常（响应里确实有），但类型层面不对齐。若要统一需把 geoIP
+   收进结构体字段。
+2. **`/stats/*` 的时间范围参数未逐一核对**：前端普遍传 `start`/`end`，
+   Go 侧各 handler 是否都正确消费、缺省行为是否与上游一致，尚未逐个验证。
+3. **`limit` / `offset` / `sortBy` / `sortOrder` / `search` 的边界值**
+   （空串、非法值、超范围）未与上游逐一比对，可能返回不同的错误码。
+4. **错误响应体格式**：Go 侧统一 `{"error": "..."}`，但上游部分路由
+   返回 `{"error":..., "message":..., "statusCode":...}`（Fastify 形态），
+   前端 `isApiStatus` 只看状态码，故暂不影响，但严格来说未对齐。
+5. **`_source` 字段**：`agent-cache` / `surge` / `clash` 三种取值，
+   目前仅 Surge 分支已输出，Clash 与 agent 分支未加，前端类型里是可选字段。
+6. **未做端到端联调**：以上均为静态代码比对，未启动服务用真实请求验证。
+   建议下一步起服务跑一遍前端页面的核心接口（summary / domains / rules / gateway）。
+7. **`/api/stats/rules/chain-flow-all`** 前端传 `start`/`end`，Go 侧
+   是否按时间范围过滤尚未核对。
+
+
 ## 已知差异
 
 | 项 | 上游行为 | Go 实现 | 原因 |
