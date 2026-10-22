@@ -49,6 +49,15 @@ build-fast:
 dev:
 	air
 
+# 本地构建 Docker 镜像（走 goproxy.cn，国内网络稳定）
+.PHONY: docker
+docker:
+	docker build -f Dockerfile -t neko-master-go:$(VERSION) \
+		--build-arg VERSION=$(VERSION) \
+		..
+	@echo "OK neko-master-go:$(VERSION)"
+	@echo "run: docker run -p 3001:3001 -v $$PWD/data:/app/data neko-master-go:$(VERSION)"
+
 .PHONY: test
 test:
 	go vet ./... && go test ./...

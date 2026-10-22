@@ -1,0 +1,76 @@
+name: Build Go Image (GHCR)
+
+# 构建 neko-master-go 单二进制镜像（前端静态产物 + Go，全栈一个镜像）。
+# 与 docker-build.yml（Node 版 collector）相互独立，互不影响。
+#
+# 注意：本仓库是 fork，Actions 需在 Settings → Actions → General 手动开启。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}-go
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from package.json
+        id: pkg
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # fork 仓库没有 DOCKERHUB_* secret，只推 GHCR（用内置 GITHUB_TOKEN）
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=raw,value=${{ steps.pkg.outputs.version }},enable=${{ github.ref_name == 'main' }}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=pr
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # context 必须是仓库根：前端是 pnpm monorepo，依赖 packages/shared
+          context: .
+          file: neko-master-go/Dockerfile
+          build-args: |
+            VERSION=${{ steps.pkg.outputs.version }}
+            GOPROXY=https://proxy.golang.org,direct
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
