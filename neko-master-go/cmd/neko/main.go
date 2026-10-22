@@ -116,6 +116,9 @@ func main() {
 	// HTTP 服务
 	// 与采集器共用同一份 realtime Manager，使 API 能看到尚未落盘的增量
 	srv := api.NewServerWithRealtime(cfg, db, log, runner.Realtime())
+	// 把 CH 写入器挂到 API，供 GET /api/db/stats 报告它的体积与行数。
+	// chWriter 为 nil（CH 未启用）时该接口完全落回 SQLite。
+	srv.AttachClickHouse(chWriter)
 	httpSrv := &http.Server{
 		Addr:              "0.0.0.0:" + cfg.APIPort,
 		Handler:           loggingMiddleware(log, srv.Handler()),

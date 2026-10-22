@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/unliar/neko-master/neko-master-go/internal/clickhouse"
 	"github.com/unliar/neko-master/neko-master-go/internal/config"
 	"github.com/unliar/neko-master/neko-master-go/internal/gateway"
 	"github.com/unliar/neko-master/neko-master-go/internal/geo"
@@ -28,6 +29,7 @@ type Server struct {
 	db    *store.DB
 	stats *stats.Service
 	geo   *geo.Lookup
+	ch    *clickhouse.Writer // 为 nil 表示 CH 未启用，仅用于 /api/db/stats 统计
 	log   *slog.Logger
 	mux   *http.ServeMux
 }
@@ -59,6 +61,12 @@ func NewServerWithRealtime(cfg *config.Config, db *store.DB, log *slog.Logger, r
 	s.routes()
 	return s
 }
+
+// AttachClickHouse 挂上 ClickHouse 写入器（nil 表示禁用）。
+//
+// 主要给 GET /api/db/stats 用：CH 启用时需要报告它的体积与行数，
+// 以及图上所示的 size 等于 sqliteSize + clickhouseSize。
+func (s *Server) AttachClickHouse(ch *clickhouse.Writer) { s.ch = ch }
 
 // Handler 返回 http.Handler（已套访问控制中间件）。
 func (s *Server) Handler() http.Handler { return s.authMiddleware(s.mux) }

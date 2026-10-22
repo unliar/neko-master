@@ -261,6 +261,7 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 ### 已修复的不匹配
 
 | 接口 | 问题 | 修复 |
+| `GET /api/db/stats` | 返回 `tables`/`dbPath`/`backendCount`，前端要的 `size`/`sqliteSize`/`clickhouseSize`/`totalConnectionsCount` 全部缺失，`formatNumber(undefined)` 崩溃弹窗 | 对齐上游 `config.controller.ts`：`sqliteSize` = page_count×page_size（额外加 -wal/-shm），`totalConnectionsCount` = CH 就绪时取 `traffic_minute` 行数否则 `minute_stats`，`size` = sqliteSize + clickhouseSize |
 |---|---|---|
 | `GET /api/gateway/rules`（Surge） | 返回 `policy`，前端 `interactive-rule-stats.tsx` 硬读 `rule.proxy`，导致 Surge 零流量规则被 `if (!proxyGroup) continue` 全部过滤 | 返回时改名 `proxy` 并固定 `size: 0`，补 `_source: 'surge'`（对齐上游 `app.ts`） |
 | `GET /api/backends/health/history` | 返回单个对象且读错参数；前端要 `BackendHealthHistory[]` 数组并传 `from`/`to` | 改为按 backend 分组的数组，读 `from`/`to`/`backendId`，缺省近 24h，`backendId` 解析失败返回 400 |

@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 )
 
@@ -20,29 +22,89 @@ func (s *Server) registerDB() {
 
 // ---------------------------------------------------------------- stats
 
+// handleDBStats 对应 GET /api/db/stats，对齐上游 config.controller.ts。
+//
+// 返回四个字段（前端 backend-config-dialog.tsx 直接消费）：
+//
+//	size                 = sqliteSize + clickhouseSize
+//	sqliteSize           = page_count * page_size（上游 getDatabaseSize 同步）
+//	clickhouseSize       = traffic_* + country_* 表体积和（CH 未启用时为 0）
+//	totalConnectionsCount= CH 就绪时取 traffic_minute 行数，否则 SQLite minute_stats 行数
+//
+// 上游的命名有误导性：函数叫 getTotalConnectionLogsCount，
+// 但查的其实是 minute_stats 而不是 connection_logs，这里照做。
+//
+// 注意：之前返回的 tables / dbPath / backendCount 三个字段前端不用，
+// 而 totalConnectionsCount 缺失会让 formatNumber(undefined) 抛 TypeError 崩溃弹窗。
 func (s *Server) handleDBStats(w http.ResponseWriter, r *http.Request) {
-	tables := []string{
-		"connection_logs", "domain_stats", "ip_stats", "proxy_stats", "rule_stats",
-		"country_stats", "device_stats", "device_domain_stats", "device_ip_stats",
-		"hourly_stats", "minute_stats", "minute_dim_stats", "hourly_dim_stats",
-		"minute_country_stats", "hourly_country_stats", "domain_proxy_stats",
-		"ip_proxy_stats", "rule_chain_traffic", "rule_domain_traffic",
-		"rule_ip_traffic", "geoip_cache", "asn_cache",
-	}
+	sqliteSize := s.dbSizeBytes()
 
-	counts := map[string]int64{}
-	for _, t := range tables {
-		var n int64
-		if err := s.db.SQL().QueryRow(`SELECT COUNT(*) FROM ` + t).Scan(&n); err == nil {
-			counts[t] = n
-		}
+	// sqliteCount 对齐上游 getTotalConnectionLogsCount：查 minute_stats。
+	var sqliteCount int64
+	_ = s.db.SQL().QueryRow(`SELECT COUNT(*) FROM minute_stats`).Scan(&sqliteCount)
+
+	// ClickHouse 就绪时用它的数据（traffic_minute 行数与 traffic_*/country_* 体积），
+	// 未启用或不健康时全部为 0，行为落回到 SQLite，与上游 resolveClickHouseStorageStats 一致。
+	chSize, chRows := s.clickHouseStorageStats(r.Context())
+
+	size := sqliteSize + chSize
+	count := sqliteCount
+	if chSize > 0 || chRows > 0 {
+		count = chRows
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"tables":       counts,
-		"dbPath":       s.db.Path(),
-		"backendCount": s.backendCount(),
+		"size":                  size,
+		"sqliteSize":            sqliteSize,
+		"clickhouseSize":        chSize,
+		"totalConnectionsCount": count,
 	})
+}
+
+// dbSizeBytes 返回 SQLite 主库文件体积（含 -wal）。
+//
+// 上游用 page_count * page_size，不含 -wal/-shm。Go 侧这里也计算
+// page_count * page_size 以保数值可比，但额外加上 WAL 体积：
+// WAL 里存的是真实占用（默认上限上千页），只看主库会显式偏小。
+func (s *Server) dbSizeBytes() int64 {
+	var pages, pageSize int64
+	if err := s.db.SQL().QueryRow(`PRAGMA page_count`).Scan(&pages); err != nil {
+		return 0
+	}
+	if err := s.db.SQL().QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return 0
+	}
+	return pages*pageSize + walSize(s.db.Path())
+}
+
+// walSize 返回 -wal / -shm 文件体积，不存在时为 0。
+func walSize(dbPath string) int64 {
+	var total int64
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if fi, err := os.Stat(dbPath + suffix); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+// clickHouseStorageStats 返回 ClickHouse 侧体积与 traffic_minute 行数。
+//
+// CH 未启用、不健康或查询失败时返回 (0, 0)，让调用方落回 SQLite。
+// 这上溉 resolveClickHouseStorageStats 的容错行为：它抛异常时 chStats 为 null，
+// 对应到 clickhouseSize=0 且 totalConnectionsCount 取 SQLite 值。
+func (s *Server) clickHouseStorageStats(ctx context.Context) (sizeBytes, trafficRows int64) {
+	if s.ch == nil || !s.ch.Enabled() {
+		return 0, 0
+	}
+	var err error
+	if sizeBytes, err = s.ch.StorageSizeBytes(ctx); err != nil {
+		return 0, 0
+	}
+	if trafficRows, err = s.ch.TrafficMinuteRows(ctx); err != nil {
+		return 0, 0
+	}
+	return sizeBytes, trafficRows
 }
 
 func (s *Server) backendCount() int64 {
