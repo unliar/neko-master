@@ -1,11 +1,14 @@
 name: Build and Push Docker Image
 
+# 【已禁用自动触发】本仓库是 fork，没有 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+# 这两个 secret（fork 不会继承上游 secret），自动跑必然失败。
+#
+# Go 版单镜像（前端静态产物 + Go，全栈）请用 docker-go.yml，它只推 GHCR，
+# 用内置 GITHUB_TOKEN，无需任何额外凭据。
+#
+# 本 workflow 保留仅供手动触发（若将来配置了 Docker Hub secret 可重新启用）。
+
 on:
-  push:
-    branches: [main, dev, "preview/**"]
-    tags: ["v*"]
-  pull_request:
-    branches: [main, dev]
   workflow_dispatch:
 
 env:
