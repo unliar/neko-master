@@ -69,6 +69,7 @@ Go 版本：
 | Surge 网关 API | `/api/gateway/proxies` 走 `/v1/policies/{name}`；`/providers/proxies` 走 `/v1/policy_groups/select`（风险点 27，两路由不合并）；`rules` 走 `parseSurgeRule`（`FINAL`→`MATCH`） | `gateway-utils.ts` |
 | ClickHouse 双写 | `internal/clickhouse`：SQLite 为主 + CH 旁路，写入统一走 `*_buffer` 表，`CH_ENABLED != 1` 时完全 no-op | `clickhouse.config.ts` / `clickhouse.writer.ts` |
 | 实时叠加 | `internal/realtime`：逐函数对齐上游 `realtime-store.ts`（`recordTraffic` / `getSummaryDelta` / `getTodayDelta` / `clearTraffic*` / `pruneOldBuckets`） | summary 为累加器，仅在 flush 成功后清零 |
+| Backend 健康检查 | `internal/health`：每分钟探洩 listening 的 backend（GET /version），结果落 `backend_health_logs`，按 UTC 分钟覆盖写 | `backend.service.ts` 的 `runHealthChecks()` + `health.repository.ts` |
 
 ### 配置变量
 

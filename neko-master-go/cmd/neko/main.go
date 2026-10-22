@@ -25,6 +25,7 @@ import (
 	"github.com/unliar/neko-master/neko-master-go/internal/clickhouse"
 	"github.com/unliar/neko-master/neko-master-go/internal/collector"
 	"github.com/unliar/neko-master/neko-master-go/internal/config"
+	"github.com/unliar/neko-master/neko-master-go/internal/health"
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
 )
 
@@ -112,6 +113,12 @@ func main() {
 	defer cancel()
 
 	go runner.Start(ctx)
+
+	// 健康检查循环：每分钟探洩 listening 的 backend 并落库。
+	// 缺了它，backend_health_logs 永远是空表，
+	// GET /api/backends/health/history 就永远返回 []（页面看不到任何健康数据）。
+	checker := health.New(db.SQL(), log, 10*time.Second, cfg.BackendTLSInsecure)
+	go checker.Start(ctx, time.Minute)
 
 	// HTTP 服务
 	// 与采集器共用同一份 realtime Manager，使 API 能看到尚未落盘的增量
