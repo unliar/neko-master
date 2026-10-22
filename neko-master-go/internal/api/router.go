@@ -621,13 +621,16 @@ func (s *Server) handleGatewayRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// c.Rules 从 mihomo 的 {rules:[...]} 取出内层数组，外壳被剥掉。
+	// 上游 TS 对 Clash 是 res.json() 整包透传，顶层仍是 {rules}。
+	// 前端 active-chain.ts 读 rules.rules，这里必须包回外壳，否则 undefined 崩溃。
 	res, err := c.Rules(r.Context())
 	if err != nil {
 		s.log.Warn("gateway rules", "backend", id, "err", err)
 		s.writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, map[string]any{"rules": res})
 }
 
 // handleGatewayProviders 对应 GET /api/gateway/providers/proxies。
