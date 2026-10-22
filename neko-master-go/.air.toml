@@ -1,0 +1,64 @@
+# air hot reload 配置
+#
+# 用法：air            （读本文件）
+#       air -c .air.toml
+#       air -d         # 前台运行并打印更多信息
+#
+# 关键设计：data/ 放的是 SQLite 文件，服务运行时每 30s 刷盘都会改它。
+# 若被 air 监控就会死循环重启，所以必须整体排除。同理排除构建产物 tmp/。
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # 只构建二进制，不在命令里带 flag —— flag 用下方 full_bin 的 shell 形式传入，
+  # 这样热重启时环境变量也能一起生效。
+  cmd = "go build -o ./tmp/main ./cmd/neko"
+
+  # 入口二进制。通过 env 前缀把 DB_PATH 指到独立文件，
+  # 避免开发期热重启把你的真实库跑乱（同时也避免库文件被监控）。
+  bin = "./tmp/main"
+
+  full_bin = "DB_PATH=./data/dev.db LOG_LEVEL=debug API_PORT=${API_PORT:-3001} ./tmp/main"
+
+  # 只监听 Go 源码与模板，其余一律不管。
+  include_ext = ["go", "tpl", "tmpl", "html"]
+
+  # 排除：数据目录（SQLite 在跑，会自触发）、构建产物、版本控制、
+  # 以及前端静态资源（前端自己走 Next dev，不归 air 管）。
+  exclude_dir = [
+    "data",
+    "tmp",
+    "web",
+    ".git",
+    "vendor",
+    "node_modules",
+  ]
+  exclude_regex = ["_test\\.go"]
+
+  # 编译失败时不杀进程，保留上一个可用的实例继续跑，
+  # 改代码改到一半时服务不会突然消失。
+  stop_on_error = false
+
+  # 保存改动后等 1s 再重建。连续敲键盘时避免每个字符都触发一次编译。
+  delay = 1000
+
+  # 进程收到 SIGTERM 后给 3s 做收尾（采集器要 flush 一次），超时才 SIGKILL。
+  kill_delay = 3000
+
+  # 发 SIGTERM 而非 SIGKILL，让 main.go 里的 shutdown 逻辑有机会跑。
+  send_interrupt = true
+
+[log]
+  # 只显示 air 自己的日志行，不带上时间戳前缀，视觉上更贴近前端 dev server。
+  time = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  # 退出时清理构建产物目录。
+  clean_on_exit = true

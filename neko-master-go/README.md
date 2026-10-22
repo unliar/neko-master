@@ -97,6 +97,36 @@ CH_WRITE_MAX_PENDING_ROWS=200000
 
 完整契约见 [`../API-DETAILS.md`](../API-DETAILS.md)（2650 行，从上游源码逐函数提取，含 40 个重写风险点）。
 
+### 开发期热重载（air）
+
+项目已配好 [air](https://github.com/cosmtrek/air) hot reload，改完 Go 代码自动重建重启。
+
+```bash
+cd neko-master-go
+air              # 热重载
+air -d           # 前台运行 + 打印文件事件（调试用）
+pnpm dev         # 等价于 air（根目录的 turbo 不包这个目录，需要切进来）
+```
+
+**必要前置**：`air` 必须在 PATH 中（安装：`go install github.com/air-verse/air@latest`，
+二进制落在 `~/go/bin/air`）。项目本身不依赖它，没有 air 时
+`go run ./cmd/neko` 照样可用。
+
+配置在 `.air.toml`，三处故意的设计：
+
+| 设定 | 原因 |
+|---|---|
+| `exclude_dir` 含 `data/` | SQLite 在运行，每 30s 刷盘都会改 `data/dev.db`；若被监控就会死循环重启 |
+| `full_bin` 指定 `DB_PATH=./data/dev.db` | 开发数据与你的真实库隔离，热重载不会把库跛乱 |
+| `exclude_dir` 含 `web/` | 前端静态资源归 Next dev 管，不归 air |
+
+其余：`delay = 1000` 避免连续键盘每个字符都触发编译；`send_interrupt = true`
+让采集器收到 SIGTERM 后有机会做最后一次 flush；`stop_on_error = false`
+保留上一个可用实例，改到一半编译失败时服务不会突然消失。
+
+端口可用环境变量改：`API_PORT=3010 air`（避开前端 dev 占的 3001）。
+
+
 ## 快速开始
 
 ```bash

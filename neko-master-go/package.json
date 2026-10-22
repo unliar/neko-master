@@ -1,0 +1,16 @@
+{
+  "name": "neko-master-go",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Go rewrite of the neko-master collector backend (hot reload via air)",
+  "scripts": {
+    "dev": "air",
+    "dev:debug": "air -d",
+    "build": "go build -o ./tmp/main ./cmd/neko",
+    "start": "./tmp/main",
+    "test": "go test ./...",
+    "vet": "go vet ./...",
+    "fmt": "gofmt -w .",
+    "check": "go vet ./... && go test ./..."
+  }
+}

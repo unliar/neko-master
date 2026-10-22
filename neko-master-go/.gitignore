@@ -1,0 +1,12 @@
+# air hot reload 构建产物（root .gitignore 已含 *.db / data/）
+tmp/
+
+# 开发期独立库，避免热重启污染真实数据（根 gitignore 的 *.db 也会覆盖到）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Go 覆盖率输出
+coverage.out
+*.prof
