@@ -262,6 +262,7 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 ### 已修复的不匹配
 
 | 接口 | 问题 | 修复 |
+| `GET /api/stats/rules/chain-flow-all` | 返回字符串节点 id + `level` + `type`，且缺 `rulePaths`/`maxLayer`；前端要 `name`/`layer`/`nodeType` + 数字边下标，ReactFlow 渲染不出来（“链路流向加载失败”） | 重写为 `stats.RuleChainFlowAll`，完整复制上游 `rule.repository.ts` 的建图逻辑：节点类型判定（无入边=rule/无出边且非内置=proxy/其余=group）、proxy 推右列、稳定排序、边下标化、`rulePaths` |
 | `GET /api/stats/domains` `/ips` | 返回裴数组，前端要 `{data,total}`（`PaginatedDomainStats`），读 `res.data` 得到 undefined → 页面全空 | 新增 `stats.DomainsPaged` / `IPsPaged`，返回 `{data,total}`；`sortBy` 白名单映射防注入 |
 | 所有 `/stats/*` 时间范围 | 前端传 `start`/`end` 但 Go 侧完全未读，时间过滤静默失效 | 新增 `parseRange` / `parseTimeParam`，兼容 RFC3339 与日期形态；解析失败静默忽略（同上游） |
 | `GET /api/db/stats` | 返回 `tables`/`dbPath`/`backendCount`，前端要的 `size`/`sqliteSize`/`clickhouseSize`/`totalConnectionsCount` 全部缺失，`formatNumber(undefined)` 崩溃弹窗 | 对齐上游 `config.controller.ts`：`sqliteSize` = page_count×page_size（额外加 -wal/-shm），`totalConnectionsCount` = CH 就绪时取 `traffic_minute` 行数否则 `minute_stats`，`size` = sqliteSize + clickhouseSize |

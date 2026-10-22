@@ -135,6 +135,20 @@ func (s *Server) handleChainFlow(w http.ResponseWriter, r *http.Request) {
 // handleChainFlowAll 对应 GET /api/stats/rules/chain-flow-all。
 //
 // 与 chain-flow 的区别：这是全量规则链路，响应结构也不同（RuleChainFlowAll）。
+// handleChainFlowAll 对应 GET /api/stats/rules/chain-flow-all。
+//
+// 结构必须对齐前端 api.ts 的 getAllRuleChainFlows：
+//
+//	nodes      每项用 name / layer / nodeType（不是 id / level / type），
+//	           并带 totalUpload / totalDownload / totalConnections / rules
+//	links      source / target 是**节点下标**（数字），不是节点名字符串
+//	rulePaths  单条规则经过的节点/边下标（nodeIndices / linkIndices）
+//	maxLayer   最大层级
+//
+// 之前返回的是字符串 id + level + type，没有 rulePaths/maxLayer，
+// ReactFlow 拿不到数字边就渲染不出来（表现为"链路流向加载失败"）。
+//
+// 建图逻辑完整实现在 stats.RuleChainFlowAll，逐段对齐上游 rule.repository.ts。
 func (s *Server) handleChainFlowAll(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolveBackendID(r)
 	if !ok || id == 0 {
@@ -142,90 +156,20 @@ func (s *Server) handleChainFlowAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 对齐上游 getRuleChainFlowMaxRows：默认 2000，下限 100。
+	// 注意上限同样是 2000（上游无上限限制，但图太大渲染不动）。
 	limit := parseLimit(r.URL.Query().Get("limit"), 2000, 2000)
+	if limit < 100 {
+		limit = 100
+	}
 
-	rows, err := s.db.SQL().Query(`
-		SELECT rule, chain, total_upload, total_download, total_connections
-		FROM rule_chain_traffic
-		WHERE backend_id = ?
-		ORDER BY (total_upload + total_download) DESC
-		LIMIT ?`, id, limit)
+	graph, err := s.stats.RuleChainFlowAll(id, limit)
 	if err != nil {
+		s.log.Error("chain-flow-all", "backend", id, "err", err)
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer rows.Close()
-
-	nodeIdx := map[string]int{}
-	nodes := []ChainFlowNode{}
-	links := []ChainFlowLink{}
-	linkSet := map[string]int{}
-
-	for rows.Next() {
-		var rule, chain string
-		var up, down, conns int64
-		if err := rows.Scan(&rule, &chain, &up, &down, &conns); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-
-		if _, ok := nodeIdx[rule]; !ok {
-			nodeIdx[rule] = len(nodes)
-			nodes = append(nodes, ChainFlowNode{ID: rule, Name: rule, Level: 0, Type: "rule"})
-		}
-		prev := rule
-		for level, hop := range strings.Split(chain, " > ") {
-			hop = strings.TrimSpace(hop)
-			if hop == "" {
-				continue
-			}
-			if _, ok := nodeIdx[hop]; !ok {
-				nodeIdx[hop] = len(nodes)
-				nodes = append(nodes, ChainFlowNode{ID: hop, Name: hop, Level: level + 1, Type: "proxy"})
-			}
-			key := prev + "→" + hop
-			if li, ok := linkSet[key]; ok {
-				links[li].Upload += up
-				links[li].Download += down
-				links[li].Total += up + down
-				links[li].ConnCount += conns
-			} else {
-				linkSet[key] = len(links)
-				links = append(links, ChainFlowLink{
-					Source: prev, Target: hop,
-					Upload: up, Download: down, Total: up + down, ConnCount: conns,
-				})
-			}
-			prev = hop
-		}
-	}
-
-	// RuleChainFlowAll 的形态：{ rules: [...], nodes, links }
-	type ruleEntry struct {
-		Rule      string `json:"rule"`
-		Upload    int64  `json:"upload"`
-		Download  int64  `json:"download"`
-		Total     int64  `json:"total"`
-		ConnCount int64  `json:"connections"`
-	}
-	ruleRows, _ := s.db.SQL().Query(`
-		SELECT rule, total_upload, total_download, total_connections
-		FROM rule_stats WHERE backend_id = ?
-		ORDER BY (total_upload + total_download) DESC LIMIT 50`, id)
-	rules := []ruleEntry{}
-	for ruleRows.Next() {
-		var e ruleEntry
-		_ = ruleRows.Scan(&e.Rule, &e.Upload, &e.Download, &e.ConnCount)
-		e.Total = e.Upload + e.Download
-		rules = append(rules, e)
-	}
-	ruleRows.Close()
-
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"rules": rules,
-		"nodes": nodes,
-		"links": links,
-	})
+	s.writeJSON(w, http.StatusOK, graph)
 }
 
 // handleRuleProxyMap 对应 GET /api/stats/rule-proxy-map。
