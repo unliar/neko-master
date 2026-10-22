@@ -270,7 +270,14 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 | `GET /api/gateway/rules`（Surge） | 返回 `policy`，前端 `interactive-rule-stats.tsx` 硬读 `rule.proxy`，导致 Surge 零流量规则被 `if (!proxyGroup) continue` 全部过滤 | 返回时改名 `proxy` 并固定 `size: 0`，补 `_source: 'surge'`（对齐上游 `app.ts`） |
 | `GET /api/backends/health/history` | 返回单个对象且读错参数；前端要 `BackendHealthHistory[]` 数组并传 `from`/`to` | 改为按 backend 分组的数组，读 `from`/`to`/`backendId`，缺省近 24h，`backendId` 解析失败返回 400 |
 
+| `GET /api/gateway/providers/proxies`（Clash） | `client.Providers` 按 `json:"providers"` 只取了内层，handler 又把它当整包返回，`providers` 外壳被剥掉 → 前端 `active-chain.ts` 读 `providers.providers` 得到 undefined，`Object.values(undefined)` 崩溃，链路图空白 | Clash 分支包回 `{ providers: res }`。上游 TS 对 Clash 是 `res.json()` 整包透传、外壳还在 |
+| WS `ruleChainFlowAll` 推送 | `buildStatsSummary` 从未给该字段赋值，推送帧恒为 nil；而前端 WS 连上后**完全不走 HTTP**（`useHttpFallback = !wsEnabled || wsStatus !== "connected"`），所以 HTTP 接口再对也进不了组件 | `sub.includeChain` 时填充 `out.RuleChainFlowAll`，加 10s TTL 缓存（建图实测约 8s，而 WS 每 2s 推一帧，每帧重建会堆叠拖垮服务） |
+| WS 端口 3002 未监听 | 前端连 `ws://localhost:3002` 恒失败；Go 侧 `WSPort`（COLLECTOR_WS_PORT）是死配置，`main.go` 从未用它 Listen，WS 路由只挂在 API server（3001）的 `/ws` 上 | **未修**，见下方风险点 |
 ### 风险点 / 待继续核对
+
+0. **【最高优先级】WS 端口 3002 从未监听**。前端 `new WebSocket(ws://localhost:3002)` 恒失败（浏览器 console: `WebSocket connection to 'ws://localhost:3002/' failed`）。根因：`config.WSPort`（COLLECTOR_WS_PORT，默认 3002）是死配置，`main.go` 从未用它 Listen；WS 路由只注册在 API server（3001）的 `/ws` 上。后果：所有实时推送失效，只能靠前端在 WS 断开时降级走 HTTP。暂未修——修它要决定 WS 是独立监听 3002 还是挂在 3001，涉及端口规划，需与 owner 确认后再动。
+
+
 
 7. **`/api/db/geoip` 上游实现在 `config.controller.ts`（不是 `app.ts`）**。
    已对齐：返回 7 字段；`effectiveProvider` 在 local 未就绪时落回 online；

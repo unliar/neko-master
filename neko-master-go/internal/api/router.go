@@ -703,13 +703,16 @@ func (s *Server) handleGatewayProviders(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// c.Providers 拿到的是 mihomo 原始响应里内层的 providers map（client.go 已解宊 json:"providers"）。
+	// 上游 TS 版对 Clash 是整包 res.json() 透传，因此顶层仍然有 providers 外壳。
+	// 前端 active-chain.ts 读 providers.providers，这里必须包回外壳，否则 providers 为 undefined 崩溃。
 	res, err := c.Providers(r.Context())
 	if err != nil {
 		s.log.Warn("gateway providers", "backend", id, "err", err)
 		s.writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, res)
+	s.writeJSON(w, http.StatusOK, map[string]any{"providers": res})
 }
 
 // ---------------------------------------------------------------- backends
