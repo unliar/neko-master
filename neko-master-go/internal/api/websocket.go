@@ -547,6 +547,48 @@ func (s *Server) applyWSMessage(sub *wsSubscription, m *wsMessage) {
 	}
 }
 
+// chainFlowCacheTTL 决定链路图多久重建一次。
+//
+// WS 默认 2 秒一帧，设 10 秒意味着大概每 5 帧才真正重建一次，
+// 断描到新流量的延迟在前端可接受范围（流量统计本身也是 30s 刷盘频率）。
+const chainFlowCacheTTL = 10 * time.Second
+
+// chainFlowCacheEntry 是缓存项：链路图 + 生成时间戳。
+type chainFlowCacheEntry struct {
+	graph   *stats.ChainFlowGraph
+	builtAt time.Time
+}
+
+var (
+	chainFlowMu    sync.Mutex
+	chainFlowCache = map[int64]*chainFlowCacheEntry{}
+)
+
+// chainFlowCached 返回指定 backend 的链路图，带 TTL 缓存。
+//
+// 缓存命中直接返回旧结果；过期则重建并更新时间戳。
+// 此处不做 singleflight（新建期间的其他帧依然返回旧结果），
+// 因为链路图没有强一致性需求，延迟更新比重复建图更值。
+func (s *Server) chainFlowCached(backendID int64) (*stats.ChainFlowGraph, error) {
+	chainFlowMu.Lock()
+	entry, ok := chainFlowCache[backendID]
+	if ok && time.Since(entry.builtAt) < chainFlowCacheTTL {
+		chainFlowMu.Unlock()
+		return entry.graph, nil
+	}
+	chainFlowMu.Unlock()
+
+	graph, err := s.stats.RuleChainFlowAll(backendID, 2000)
+	if err != nil {
+		return nil, err
+	}
+
+	chainFlowMu.Lock()
+	chainFlowCache[backendID] = &chainFlowCacheEntry{graph: graph, builtAt: time.Now()}
+	chainFlowMu.Unlock()
+	return graph, nil
+}
+
 // pushStats 生成并推送一帧 stats。
 func (s *Server) pushStats(c *wsConn, sub *wsSubscription) {
 	if sub.backendID == 0 {
@@ -705,6 +747,21 @@ func (s *Server) buildStatsSummary(sub *wsSubscription) (*model.StatsSummary, st
 				Offset: q.Offset, Limit: q.Limit,
 				SortBy: reverseSortKey(q.SortBy), SortOrder: q.SortOrder, Search: q.Search,
 			}
+		}
+	}
+
+	// 链路流向图：前端 rule-chain-flow 组件在 WS 连接时完全依赖推送帧里的
+	// ruleChainFlowAll（看 useHttpFallback = !wsEnabled || wsStatus !== "connected"）。
+	// 此前从未填充这个字段，导致前端 if (!stats.ruleChainFlowAll) return
+	// 永远接收不到数据，图一直空着。
+	if sub.includeChain {
+		// 链路图建图耗时较高（上千 rule/chain 行），而 WS 每 2 秒推一帧。
+		// 若每帧都重建，建图超过推送周期会堆积并拖慢整个服务。
+		// 因此按 backend 做短 TTL 缓存：超出 TTL 才重建，并发请求共享同一次结果。
+		if graph, err := s.chainFlowCached(sub.backendID); err == nil {
+			out.RuleChainFlowAll = graph
+		} else {
+			s.log.Warn("ws chain flow", "backend", sub.backendID, "err", err)
 		}
 	}
 
