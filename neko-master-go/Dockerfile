@@ -87,7 +87,16 @@ WORKDIR /app
 
 COPY --from=go-build /out/neko /usr/local/bin/neko
 
-USER neko
+# 以 root 运行（上游 Node 版镜像同样是 root）。
+#
+# 原因：旧部署的 data 卷是 Node 版镜像创建的、属主是 root。
+# 若这里用非 root（uid 1000），挂载旧卷后会报
+# "attempt to write a readonly database" — 读得到但写不了。
+# 保持 root 让已有部署无痛升级，不必逐个 chown 数据目录。
+#
+# 注意：这是有意的兼容性抜弃，不是遗漏。
+# 若将来要收拨安全，应先给出数据卷 chown 的迁移说明，再切回非 root。
+USER root
 
 # 单镜像模式下 UI 与 API 同源，一个端口提供全部：
 #   /        → 前端 UI（302 到 /zh/）
