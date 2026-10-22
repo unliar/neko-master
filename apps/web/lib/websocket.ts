@@ -163,19 +163,25 @@ function getWsUrlCandidates(): string[] {
     const hostForPort = runtime?.WS_HOST || window.location.hostname;
     const directUrl = `${wsProtocol}://${hostForPort}:${wsPort}`;
     const hostForPath = runtime?.WS_HOST || window.location.host;
-    const pathUrl = `${wsProtocol}://${hostForPath}/_cm_ws`;
 
-    // Prefer direct port URL when an explicit WS port is configured at runtime
-    // (e.g. Docker with WS_EXTERNAL_PORT), since /_cm_ws has no WS proxy in Next.js.
-    // In development, also prefer direct so the dev WS server is hit first.
-    const preferDirect =
-      process.env.NODE_ENV === 'development' || !!runtime?.WS_PORT;
-    if (preferDirect) {
+    // 同源 /ws —— 单二进制部署（前端 embed 进 Go）的唯一正确入口。
+    // Go 侧把 WebSocket 挂在 API 同一端口（3001）的 /ws 上，
+    // 因此这里用相对路径即可，无需知道任何端口，也没有跨域问题。
+    const sameOriginUrl = `${wsProtocol}://${hostForPath}/ws`;
+    // 兼容旧的双服务部署（Next :3000 + 独立 WS :3002）。
+    const legacyPathUrl = `${wsProtocol}://${hostForPath}/_cm_ws`;
+
+    // 若显式配置了 WS_PORT / WS_URL，说明是旧的双服务部署，优先走它；
+    // 否则默认同源 /ws（单二进制模式），再回退到旧候选。
+    const explicitPort = !!runtime?.WS_PORT || !!process.env.NEXT_PUBLIC_WS_PORT;
+    if (explicitPort) {
       pushCandidate(directUrl);
-      pushCandidate(pathUrl);
+      pushCandidate(legacyPathUrl);
+      pushCandidate(sameOriginUrl);
     } else {
-      pushCandidate(pathUrl);
+      pushCandidate(sameOriginUrl);
       pushCandidate(directUrl);
+      pushCandidate(legacyPathUrl);
     }
 
     return uniqueCandidates;
