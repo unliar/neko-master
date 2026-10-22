@@ -3,7 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
@@ -137,9 +137,13 @@ func (s *Server) handleDBGeoIPGet(w http.ResponseWriter, r *http.Request) {
 		apiURL = s.cfg.GeoOnlineAPIURL
 	}
 
-	// effectiveProvider 是真正生效的值：配了 local 但 MMDB
-	// 没加载成功时仍然回落到 online，必须告诉前端。
-	dir, ready, missing := s.geo.LocalStatus()
+	// MMDB 状态实时探文件，不读进程启动时的加载结果。
+	// 否则用户拷进 MMDB 后仍会看到"缺文件"。
+	missing := s.geo.MissingMMDBFiles()
+	ready := len(missing) == 0
+
+	// effectiveProvider 对齐上游 toGeoLookupResponse：
+	// local 且未就绪 → 落回 online（用 !== false 的三目运算语义）。
 	effective := configured
 	if configured == "local" && !ready {
 		effective = "online"
@@ -150,49 +154,86 @@ func (s *Server) handleDBGeoIPGet(w http.ResponseWriter, r *http.Request) {
 		APIURL:            apiURL,
 		ConfiguredProv:    configured,
 		EffectiveProvider: effective,
-		MmdbDir:           dir,
+		MmdbDir:           s.geo.MmdbDir(),
 		LocalMmdbReady:    ready,
 		MissingMmdbFiles:  missing,
 	})
 }
 
+// handleDBGeoIPPut 对应 PUT /api/db/geoip，对齐上游 config.controller.ts。
+//
+// 校验顺序必须与上游一致：
+//  1. provider 非 online/local → 400 provider must be 'online' or 'local'
+//  2. onlineApiUrl 提供了但不是 http/https → 400
+//  3. provider == local 且 MMDB 未就绪 → 400，带 missingMmdbFiles
+//
+// 第 3 条是关键：上游不允许在没有 MMDB 时切到
+// local（否则 GeoIP 全面失效），我们之前只打 warn
+// 然后照单，行为与上游不一致。
 func (s *Server) handleDBGeoIPPut(w http.ResponseWriter, r *http.Request) {
-	var req geoCfg
+	var req struct {
+		Provider     string `json:"provider"`
+		OnlineAPIURL string `json:"onlineApiUrl"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeErr(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	p := strings.ToLower(strings.TrimSpace(req.Provider))
-	if p != "online" && p != "local" {
+
+	if req.Provider != "" && req.Provider != "online" && req.Provider != "local" {
 		s.writeErr(w, http.StatusBadRequest, "provider must be 'online' or 'local'")
 		return
 	}
-	if req.APIURL == "" {
-		req.APIURL = s.cfg.GeoOnlineAPIURL
+
+	if req.OnlineAPIURL != "" && !isValidHTTPURL(req.OnlineAPIURL) {
+		s.writeErr(w, http.StatusBadRequest, "onlineApiUrl must be a valid http/https URL")
+		return
 	}
+
+	p := req.Provider
+	apiURL := req.OnlineAPIURL
+	if p == "" {
+		p = s.cfg.GeoLookupProvider
+	}
+	if apiURL == "" {
+		apiURL = s.cfg.GeoOnlineAPIURL
+	}
+
+	// provider=local 前置校验：拒绝在 MMDB 缺失时切到 local。
+	// 这里直接探文件，不依赖进程启动时的加载结果。
+	missing := s.geo.MissingMMDBFiles()
+	if p == "local" && len(missing) > 0 {
+		s.writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":            "Local MMDB is not ready. Missing required files.",
+			"missingMmdbFiles": missing,
+		})
+		return
+	}
+
 	s.setConfig("geoip.lookup_provider", p)
-	s.setConfig("geoip.online_api_url", req.APIURL)
-	// 返回完整 geoCfg，与 GET 保持同一套字段。
-	// 前端改完配置会用这份数据更新表单，
-	// 缺 localMmdbReady / missingMmdbFiles 依然会抛 TypeError。
-	// 注意 MMDB 的加载状态不会因本次 PUT 改变，照实返回。
-	dir, ready, missing := s.geo.LocalStatus()
-	if p == "local" && !ready {
-		s.log.Warn("geoip: provider set to local but MMDB not loaded, falls back to online",
-			"dir", dir, "missing", missing)
-	}
+	s.setConfig("geoip.online_api_url", apiURL)
+
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"message": "GeoIP settings updated",
+		"message": "GeoIP configuration updated",
 		"config": geoCfg{
 			Provider:          p,
-			APIURL:            req.APIURL,
+			APIURL:            apiURL,
 			ConfiguredProv:    p,
 			EffectiveProvider: p,
-			MmdbDir:           dir,
-			LocalMmdbReady:    ready,
+			MmdbDir:           s.geo.MmdbDir(),
+			LocalMmdbReady:    len(missing) == 0,
 			MissingMmdbFiles:  missing,
 		},
 	})
+}
+
+// isValidHTTPURL 对齐上游 isValidHttpUrl：只接受 http/https。
+func isValidHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 // ---------------------------------------------------------------- cleanup

@@ -79,6 +79,27 @@ func (l *Lookup) Provider() string { return l.provider }
 
 // IP 查询单个 IP 的归属。
 // 私有地址与查询失败都返回 nil，绝不阻断主流程。
+// MmdbDir 返回 MMDB 目录。
+func (l *Lookup) MmdbDir() string { return l.mmdbDir }
+
+// requiredMMDBFiles 对齐上游 ConfigRepository.REQUIRED_MMDB_FILES。
+var requiredMMDBFiles = []string{"GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"}
+
+// MissingMMDBFiles 实时探文件系统，返回缺失的必需 MMDB。
+//
+// 上游 config.repository.ts 的 getMissingMmdbFiles 同样每次探文件（带 5s
+// TTL 缓存）。这很关键：启动时文件不存、但用户随后拷进去了，
+// 接口必须看得到。若只读进程启动时的加载状态，用户拷完还会被告诉缺文件。
+func (l *Lookup) MissingMMDBFiles() []string {
+	missing := []string{}
+	for _, f := range requiredMMDBFiles {
+		if _, err := os.Stat(filepath.Join(l.mmdbDir, f)); err != nil {
+			missing = append(missing, f)
+		}
+	}
+	return missing
+}
+
 func (l *Lookup) IP(ip string) *model.GeoIPInfo {
 	if ip == "" {
 		return nil
@@ -379,29 +400,6 @@ func (l *Lookup) saveDB(ip string, v *model.GeoIPInfo) {
 }
 
 // ---------------------------------------------------------------- 运维
-
-// LocalStatus 描述本地 MMDB 的可用性。
-//
-// 专门给 GET /api/db/geoip 用：前端 backend-config-dialog.tsx
-// 读 localMmdbReady 与 missingMmdbFiles 来提示用户拷哪些文件。
-// 这两个字段缺一个就会让 missingMmdbFiles.join()
-// 抛 TypeError，整个对话框崩溃。
-func (l *Lookup) LocalStatus() (dir string, ready bool, missing []string) {
-	l.mu.RLock()
-	cityOK := len(l.cityRaw) > 0
-	asnOK := len(l.asnRaw) > 0
-	l.mu.RUnlock()
-
-	missing = []string{}
-	if !cityOK {
-		missing = append(missing, "GeoLite2-City.mmdb")
-	}
-	if !asnOK {
-		missing = append(missing, "GeoLite2-ASN.mmdb")
-	}
-	return l.mmdbDir, cityOK && asnOK, missing
-}
-
 // Stats 返回 MMDB 加载状态。
 func (l *Lookup) Stats() map[string]any {
 	return map[string]any{

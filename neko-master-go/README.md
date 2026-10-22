@@ -212,8 +212,6 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 后端另有前端不直接调用的路由：`/api/agent/*`（agent 反向上报）、
 `/api/stats/global`、`/api/stats/hourly`、`/api/stats/trend`、
 `/api/stats/rule-proxy-map`、`/api/stats/rules/chain-flow`、
-`/api/stats/connections`、`/api/db/vacuum`、`/api/db/geoip/lookup`、
-`/api/db/geoip/status`、`/api/gateway/providers/proxies/refresh`、
 `/api/backends/active`、`/api/backends/listening`、
 `/api/backends/{id}/{activate,listening,clear-data,rotate-agent-token,test}`。
 其中 backends 的 CRUD 子路由是前端通过路径模板拼接调用的，非缺失。
@@ -238,6 +236,12 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 | `GET /api/backends/health/history` | 返回单个对象且读错参数；前端要 `BackendHealthHistory[]` 数组并传 `from`/`to` | 改为按 backend 分组的数组，读 `from`/`to`/`backendId`，缺省近 24h，`backendId` 解析失败返回 400 |
 
 ### 风险点 / 待继续核对
+
+7. **`/api/db/geoip` 上游实现在 `config.controller.ts`（不是 `app.ts`）**。
+   已对齐：返回 7 字段；`effectiveProvider` 在 local 未就绪时落回 online；
+   PUT 拒绝在缺 MMDB 时切 local（上游只打 warn，已修正为一致）；
+   `missingMmdbFiles` 实时探文件而非读启动时加载状态。
+   仍未对齐：上游有 5s TTL 的 MMDB 状态缓存，Go 侧每次探磁盘。
 
 1. **`geoIP` 字段来源不一致**：前端 `IPStats` 声明了 `geoIP`，但 Go 侧
    `IPRow` 结构体没有该字段，靠 `attachGeoIPs` 序列化后动态附加。
