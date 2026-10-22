@@ -380,6 +380,28 @@ func (l *Lookup) saveDB(ip string, v *model.GeoIPInfo) {
 
 // ---------------------------------------------------------------- 运维
 
+// LocalStatus 描述本地 MMDB 的可用性。
+//
+// 专门给 GET /api/db/geoip 用：前端 backend-config-dialog.tsx
+// 读 localMmdbReady 与 missingMmdbFiles 来提示用户拷哪些文件。
+// 这两个字段缺一个就会让 missingMmdbFiles.join()
+// 抛 TypeError，整个对话框崩溃。
+func (l *Lookup) LocalStatus() (dir string, ready bool, missing []string) {
+	l.mu.RLock()
+	cityOK := len(l.cityRaw) > 0
+	asnOK := len(l.asnRaw) > 0
+	l.mu.RUnlock()
+
+	missing = []string{}
+	if !cityOK {
+		missing = append(missing, "GeoLite2-City.mmdb")
+	}
+	if !asnOK {
+		missing = append(missing, "GeoLite2-ASN.mmdb")
+	}
+	return l.mmdbDir, cityOK && asnOK, missing
+}
+
 // Stats 返回 MMDB 加载状态。
 func (l *Lookup) Stats() map[string]any {
 	return map[string]any{

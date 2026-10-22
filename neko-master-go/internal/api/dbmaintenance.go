@@ -107,22 +107,53 @@ func (s *Server) handleDBRetentionPut(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- geoip
 
+// geoCfg 对齐前端 api.ts 的 GeoLookupConfig。
+//
+// 注意 localMmdbReady / missingMmdbFiles / mmdbDir 三个字段
+// 前端 backend-config-dialog.tsx 直接消费（包括
+// missingMmdbFiles.join()），缺任何一个都会抛
+// "Cannot read properties of undefined" 并崩溃整个对话框。
 type geoCfg struct {
-	Provider string `json:"provider"`
-	APIURL   string `json:"apiUrl"`
+	Provider          string   `json:"provider"`
+	APIURL            string   `json:"apiUrl"`
+	ConfiguredProv    string   `json:"configuredProvider"`
+	EffectiveProvider string   `json:"effectiveProvider"`
+	MmdbDir           string   `json:"mmdbDir"`
+	LocalMmdbReady    bool     `json:"localMmdbReady"`
+	MissingMmdbFiles  []string `json:"missingMmdbFiles"`
 }
 
 func (s *Server) handleDBGeoIPGet(w http.ResponseWriter, r *http.Request) {
 	var provider, apiURL string
 	_ = s.db.SQL().QueryRow(`SELECT value FROM app_config WHERE key = 'geoip.lookup_provider'`).Scan(&provider)
 	_ = s.db.SQL().QueryRow(`SELECT value FROM app_config WHERE key = 'geoip.online_api_url'`).Scan(&apiURL)
-	if provider == "" {
-		provider = s.cfg.GeoLookupProvider
+
+	// configuredProvider 记用户显式配的值（否则回落环境默认）
+	configured := provider
+	if configured == "" {
+		configured = s.cfg.GeoLookupProvider
 	}
 	if apiURL == "" {
 		apiURL = s.cfg.GeoOnlineAPIURL
 	}
-	s.writeJSON(w, http.StatusOK, geoCfg{Provider: provider, APIURL: apiURL})
+
+	// effectiveProvider 是真正生效的值：配了 local 但 MMDB
+	// 没加载成功时仍然回落到 online，必须告诉前端。
+	dir, ready, missing := s.geo.LocalStatus()
+	effective := configured
+	if configured == "local" && !ready {
+		effective = "online"
+	}
+
+	s.writeJSON(w, http.StatusOK, geoCfg{
+		Provider:          effective,
+		APIURL:            apiURL,
+		ConfiguredProv:    configured,
+		EffectiveProvider: effective,
+		MmdbDir:           dir,
+		LocalMmdbReady:    ready,
+		MissingMmdbFiles:  missing,
+	})
 }
 
 func (s *Server) handleDBGeoIPPut(w http.ResponseWriter, r *http.Request) {
@@ -141,9 +172,26 @@ func (s *Server) handleDBGeoIPPut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.setConfig("geoip.lookup_provider", p)
 	s.setConfig("geoip.online_api_url", req.APIURL)
+	// 返回完整 geoCfg，与 GET 保持同一套字段。
+	// 前端改完配置会用这份数据更新表单，
+	// 缺 localMmdbReady / missingMmdbFiles 依然会抛 TypeError。
+	// 注意 MMDB 的加载状态不会因本次 PUT 改变，照实返回。
+	dir, ready, missing := s.geo.LocalStatus()
+	if p == "local" && !ready {
+		s.log.Warn("geoip: provider set to local but MMDB not loaded, falls back to online",
+			"dir", dir, "missing", missing)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "GeoIP settings updated",
-		"config":  geoCfg{Provider: p, APIURL: req.APIURL},
+		"config": geoCfg{
+			Provider:          p,
+			APIURL:            req.APIURL,
+			ConfiguredProv:    p,
+			EffectiveProvider: p,
+			MmdbDir:           dir,
+			LocalMmdbReady:    ready,
+			MissingMmdbFiles:  missing,
+		},
 	})
 }
 
