@@ -177,7 +177,7 @@ func (s *Server) handleDBRetentionPut(w http.ResponseWriter, r *http.Request) {
 // "Cannot read properties of undefined" 并崩溃整个对话框。
 type geoCfg struct {
 	Provider          string   `json:"provider"`
-	APIURL            string   `json:"apiUrl"`
+	APIURL            string   `json:"onlineApiUrl"`
 	ConfiguredProv    string   `json:"configuredProvider"`
 	EffectiveProvider string   `json:"effectiveProvider"`
 	MmdbDir           string   `json:"mmdbDir"`
