@@ -132,13 +132,25 @@ func (s *Server) registerAuth() {
 
 // handleAuthState 返回 { enabled, hasToken }。
 func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
+	// 对齐上游 auth.service.ts 的 getAuthState：
+	//   forcedOff = FORCE_ACCESS_CONTROL_OFF==='true'
+	//   enabled   = forcedOff ? false : config.enabled
+	//   showcaseMode = SHOWCASE_SITE_MODE==='true'
+	// 前端 backend-config-dialog.tsx:2990 读 forceAccessControlOff 控制「修改 token」区显示，
+	// time-range-picker 读 showcaseMode 禁用长跨度预设，缺字段会导致这些控制行为错误。
+	forcedOff := s.cfg.ForceAccessControlOff
 	enabled := false
 	if v, ok := s.authEnabled(); ok {
 		enabled = v
 	}
+	if forcedOff {
+		enabled = false
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":  enabled,
-		"hasToken": s.tokenHash() != "",
+		"enabled":               enabled,
+		"hasToken":              s.tokenHash() != "",
+		"forceAccessControlOff": forcedOff,
+		"showcaseMode":          s.cfg.ShowcaseSiteMode,
 	})
 }
 
