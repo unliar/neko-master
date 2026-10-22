@@ -15,12 +15,22 @@ import (
 // SQLite 是唯一权威数据源；ch 为 nil 时（未启用 ClickHouse）
 // 双写是 no-op。即使双写失败也不回滚 SQLite 事务。
 type Writer struct {
-	db *DB
-	ch *clickhouse.Writer
+	db  *DB
+	ch  *clickhouse.Writer
+	geo GeoResolver
+}
+
+// GeoResolver 按 IP 查 GeoIP，geo.Lookup 满足它。
+// 定义在 store 包以避免 store -> collector 的反向依赖。
+type GeoResolver interface {
+	IP(ip string) *model.GeoIPInfo
 }
 
 // NewWriter 创建写入器。
 func NewWriter(db *DB) *Writer { return &Writer{db: db} }
+
+// AttachGeo 挂上 GeoIP 查询器，启用国家维度统计。nil 表示关闭。
+func (w *Writer) AttachGeo(g GeoResolver) { w.geo = g }
 
 // NewWriterWithClickHouse 创建带 ClickHouse 旁路双写的写入器。
 func NewWriterWithClickHouse(db *DB, ch *clickhouse.Writer) *Writer {
@@ -69,7 +79,59 @@ func (w *Writer) Flush(backendID int64, updates []model.TrafficUpdate) error {
 		}
 	}
 
+	// 国家维度：把本轮流量按 IP 归属到国家，写 country_stats 三张表。
+	// geo 未挂载（nil）时跳过。geo 查询走 Lookup.IP 自带的内存+DB 缓存，
+	// 内网/回环 IP 直接返回 nil，不落国家维度（与上游一致：只有公网 IP 才有归属）。
+	if w.geo != nil {
+		if err := w.writeCountries(backendID, updates); err != nil {
+			// 国家维度是附加维度，失败不应影响主流量已提交的结果
+			_ = err
+		}
+	}
+
 	return nil
+}
+
+// writeCountries 把一批流量按 IP 查 GeoIP 聚合成国家维度落库。
+func (w *Writer) writeCountries(backendID int64, updates []model.TrafficUpdate) error {
+	// 先按 IP 聚合本轮流量（同一 IP 多条增量合并，避免重复查 geo）
+	type acc struct {
+		up, down, conns int64
+		ts              time.Time
+	}
+	byIP := map[string]*acc{}
+	for _, u := range updates {
+		if u.IP == "" {
+			continue
+		}
+		a := byIP[u.IP]
+		if a == nil {
+			a = &acc{ts: u.TimestampMs}
+			byIP[u.IP] = a
+		}
+		a.up += u.Upload
+		a.down += u.Download
+		a.conns += u.Connections
+		if u.TimestampMs.After(a.ts) {
+			a.ts = u.TimestampMs
+		}
+	}
+	if len(byIP) == 0 {
+		return nil
+	}
+
+	countries := make([]CountryUpdate, 0, len(byIP))
+	for ip, a := range byIP {
+		info := w.geo.IP(ip)
+		if info == nil {
+			continue // 内网/回环/未命中，无国家归属
+		}
+		countries = append(countries, geoToCountryUpdate(info, a.up, a.down, a.conns, a.ts))
+	}
+	if len(countries) == 0 {
+		return nil
+	}
+	return w.FlushCountries(backendID, countries)
 }
 
 // upsertOne 把单条增量写入各个维度表。

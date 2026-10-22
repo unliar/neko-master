@@ -63,6 +63,9 @@ func NewServerWithRealtime(cfg *config.Config, db *store.DB, log *slog.Logger, r
 	return s
 }
 
+// Geo 暴露 GeoIP 查询器，供采集器按 IP 查国家（国家维度统计需要）。
+func (s *Server) Geo() *geo.Lookup { return s.geo }
+
 // AttachClickHouse 挂上 ClickHouse 写入器（nil 表示禁用）。
 //
 // 主要给 GET /api/db/stats 用：CH 启用时需要报告它的体积与行数，

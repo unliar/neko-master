@@ -109,10 +109,17 @@ func main() {
 		cfg.BackendTLSInsecure,
 	)
 
+	// HTTP 服务（先建，供下面把 geo / CH 挂到 writer）
+	// 与采集器共用同一份 realtime Manager，使 API 能看到尚未落盘的增量
+	srv := api.NewServerWithRealtime(cfg, db, log, runner.Realtime())
+	srv.AttachClickHouse(chWriter)
+
+	// 把 GeoIP 查询器挂到 writer，启用国家维度统计（country_stats 三张表）。
+	// 复用 srv 里的同一份 Lookup，内存+DB 缓存共享，不重复构造。
+	writer.AttachGeo(srv.Geo())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	go runner.Start(ctx)
 
 	// 健康检查循环：每分钟探洩 listening 的 backend 并落库。
 	// 缺了它，backend_health_logs 永远是空表，
@@ -120,12 +127,8 @@ func main() {
 	checker := health.New(db.SQL(), log, 10*time.Second, cfg.BackendTLSInsecure)
 	go checker.Start(ctx, time.Minute)
 
-	// HTTP 服务
-	// 与采集器共用同一份 realtime Manager，使 API 能看到尚未落盘的增量
-	srv := api.NewServerWithRealtime(cfg, db, log, runner.Realtime())
-	// 把 CH 写入器挂到 API，供 GET /api/db/stats 报告它的体积与行数。
-	// chWriter 为 nil（CH 未启用）时该接口完全落回 SQLite。
-	srv.AttachClickHouse(chWriter)
+	go runner.Start(ctx)
+
 	httpSrv := &http.Server{
 		Addr:              "0.0.0.0:" + cfg.APIPort,
 		Handler:           loggingMiddleware(log, srv.Handler()),
