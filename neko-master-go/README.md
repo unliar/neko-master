@@ -262,6 +262,8 @@ PUT  /api/backends/{id}                  DELETE /api/backends/{id}
 ### 已修复的不匹配
 
 | 接口 | 问题 | 修复 |
+| `GET /api/stats/domains` `/ips` | 返回裴数组，前端要 `{data,total}`（`PaginatedDomainStats`），读 `res.data` 得到 undefined → 页面全空 | 新增 `stats.DomainsPaged` / `IPsPaged`，返回 `{data,total}`；`sortBy` 白名单映射防注入 |
+| 所有 `/stats/*` 时间范围 | 前端传 `start`/`end` 但 Go 侧完全未读，时间过滤静默失效 | 新增 `parseRange` / `parseTimeParam`，兼容 RFC3339 与日期形态；解析失败静默忽略（同上游） |
 | `GET /api/db/stats` | 返回 `tables`/`dbPath`/`backendCount`，前端要的 `size`/`sqliteSize`/`clickhouseSize`/`totalConnectionsCount` 全部缺失，`formatNumber(undefined)` 崩溃弹窗 | 对齐上游 `config.controller.ts`：`sqliteSize` = page_count×page_size（额外加 -wal/-shm），`totalConnectionsCount` = CH 就绪时取 `traffic_minute` 行数否则 `minute_stats`，`size` = sqliteSize + clickhouseSize |
 |---|---|---|
 | `GET /api/gateway/rules`（Surge） | 返回 `policy`，前端 `interactive-rule-stats.tsx` 硬读 `rule.proxy`，导致 Surge 零流量规则被 `if (!proxyGroup) continue` 全部过滤 | 返回时改名 `proxy` 并固定 `size: 0`，补 `_source: 'surge'`（对齐上游 `app.ts`） |

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +150,39 @@ func (s *Server) writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) writeErr(w http.ResponseWriter, code int, msg string) {
 	s.writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// parseRange 解析 start / end 查询参数。
+//
+// 前端所有统计接口都传时间范围（ISO8601）。早前的实现完全
+// 没读这两个参数，等于时间过滤静默失效。
+// 解析失败时返回 (nil, nil) —— 不报错，
+// 因为上游也是静默忽略非法值。
+func (s *Server) parseRange(q url.Values) (start, end *time.Time) {
+	return parseTimeParam(q.Get("start")), parseTimeParam(q.Get("end"))
+}
+
+// parseTimeParam 解析单个时间参数，容庅多种格式。
+func parseTimeParam(raw string) *time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, raw); err == nil {
+			u := t.UTC()
+			return &u
+		}
+	}
+	return nil
 }
 
 // resolveBackendID 对齐上游 getBackendId：
@@ -294,7 +328,16 @@ func (s *Server) handleDomains(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(q.Get("limit"), 50, 500)
 	offset := parseOffset(q.Get("offset"))
 
-	res, err := s.stats.TopDomains(id, limit, offset)
+	// 返回必须是 {data, total}（对齐上游 PaginatedDomainStats）。
+	// 之前直接向前端向的形式固然错了。
+	rStart, rEnd := s.parseRange(q)
+	res, err := s.stats.DomainsPaged(id, stats.PageOptions{
+		Offset:    offset,
+		Limit:     limit,
+		SortBy:    q.Get("sortBy"),
+		SortOrder: q.Get("sortOrder"),
+		Search:    q.Get("search"),
+	}, rStart, rEnd)
 	if err != nil {
 		s.log.Error("domains", "err", err)
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
@@ -313,13 +356,25 @@ func (s *Server) handleIPs(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(q.Get("limit"), 50, 500)
 	offset := parseOffset(q.Get("offset"))
 
-	res, err := s.stats.TopIPs(id, limit, offset)
+	// 必须返回 {data, total}（对齐上游 PaginatedIPStats）。
+	// 之前向前端向的形式固然错了，这里同时修掉。
+	rStart, rEnd := s.parseRange(q)
+	res, err := s.stats.IPsPaged(id, stats.PageOptions{
+		Offset:    offset,
+		Limit:     limit,
+		SortBy:    q.Get("sortBy"),
+		SortOrder: q.Get("sortOrder"),
+		Search:    q.Get("search"),
+	}, rStart, rEnd)
 	if err != nil {
 		s.log.Error("ips", "err", err)
 		s.writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, s.attachGeoIPs(toAnySlice(res)))
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"data":  s.attachGeoIPs(toAnySlice(res.Data)),
+		"total": res.Total,
+	})
 }
 
 func (s *Server) handleProxies(w http.ResponseWriter, r *http.Request) {
