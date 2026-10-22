@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -733,15 +734,31 @@ func maskToken(tok string) string {
 
 // ---------------------------------------------------------------- 静态资源
 
-// mountStatic 在存在 web/out 时提供前端静态文件。
+// mountStatic 提供前端静态文件。
+//
+// 优先用 embed 进二制的产物（web/out 由 makefile 构建前端时拷入），
+// 这样 go build 出来的单文件自带 UI，不依赖部署目录里另放前端产物。
+// 若 embed 里没有产物（未执行 make build-web），则退化为读磁盘 web/out，方便开发期间调试。
 func (s *Server) mountStatic() {
+	if h, ok := staticFileServer(); ok {
+		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				s.writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+		return
+	}
+
+	// 开发期 fallback：直接读磁盘产物（make dev-web 生成的）
 	dir := "web/out"
-	if strings.TrimSpace(dir) == "" {
+	if _, err := os.Stat(dir); err != nil {
+		s.log.Info("static: no embedded web/out, UI not served")
 		return
 	}
 	fs := http.FileServer(http.Dir(dir))
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// API 路径不应落到这里
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			s.writeErr(w, http.StatusNotFound, "not found")
 			return

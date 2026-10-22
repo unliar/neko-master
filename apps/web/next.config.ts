@@ -10,35 +10,40 @@ const rootPkg = JSON.parse(
   readFileSync(join(__dirname, "../../package.json"), "utf-8"),
 );
 
-// API URL configuration
-// - For local dev (default): http://localhost:3001
-// - For Docker/custom: set API_URL env variable
-// - Can use absolute URL (with protocol) or relative path
+// API URL configuration（仅开发模式用于 rewrites 代理）
 const apiUrl = process.env.API_URL || "http://localhost:3001";
-const API_DESTINATION = apiUrl.endsWith('/api')
-  ? `${apiUrl}/:path*` 
+const API_DESTINATION = apiUrl.endsWith("/api")
+  ? `${apiUrl}/:path*`
   : `${apiUrl}/api/:path*`;
 
-// Base Next.js config
+// SPA 静态导出模式
+// ---------------------------------------------------------------
+// 打包成单二进制时，前端产物由 Go 后端以同源方式托管：
+//   - 页面/静态资源：Go embed 的静态文件
+//   - /api/*        ：Go 的 HTTP handler
+//   - /ws           ：Go 的 WebSocket handler（同源同端口）
+// 因此前端所有请求都用相对路径（/api、/ws），无需跨域配置。
+//
+// 注意 output: 'export' 的硬性约束：
+//   - rewrites / headers 不生效（仅在 dev 下保留 rewrites 方便联调）
+//   - next/image 的服务端优化不可用 → 必须 unoptimized
+//   - 每个动态路由段必须有 generateStaticParams
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  output: 'standalone',
-  outputFileTracingRoot: join(__dirname, '../..'),
+  output: "export",
+  // 导出为 index.html 目录结构，便于 Go 静态文件服务做目录匹配
+  trailingSlash: true,
+  // 静态导出无法运行 Next 的图片优化服务，必须关闭
+  images: { unoptimized: true },
   env: {
     NEXT_PUBLIC_APP_VERSION: rootPkg.version || "0.0.0",
-    // NOTE: NEXT_PUBLIC_WS_PORT is a build-time variable baked into the JS bundle.
-    // At runtime (e.g. Docker), use WS_EXTERNAL_PORT env var instead — it is written
-    // into runtime-config.js by docker-start.sh and read via window.__RUNTIME_CONFIG__.
-    NEXT_PUBLIC_WS_PORT: process.env.NEXT_PUBLIC_WS_PORT || "3002",
   },
-  // Turbopack configuration (formerly experimental.turbopack)
-  turbopack: {
-    // Enable filesystem caching for faster rebuilds
-    resolveAlias: {
-      // Handle any Node.js native module imports in client code
-    },
-  },
+  turbopack: {},
+  // rewrites 只在 dev 生效（生产是静态导出，由 Go 同源托管，不需要代理）
   async rewrites() {
+    if (process.env.NODE_ENV === "production") {
+      return [];
+    }
     return [
       {
         source: "/manifest.json",
@@ -50,43 +55,16 @@ const nextConfig: NextConfig = {
       },
     ];
   },
-  async headers() {
-    return [
-      {
-        source: "/sw.js",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "public, max-age=0, must-revalidate",
-          },
-          {
-            key: "Service-Worker-Allowed",
-            value: "/",
-          },
-        ],
-      },
-      {
-        // runtime-config.js is rewritten at container start with the real
-        // external ports / URLs (docker-start.sh). It must never be cached or
-        // the browser keeps using the stale build-time default, ignoring
-        // WS_EXTERNAL_PORT / API_EXTERNAL_PORT. See issue #61.
-        source: "/runtime-config.js",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "no-store, no-cache, must-revalidate",
-          },
-        ],
-      },
-    ];
-  },
 };
 
-// Apply PWA in production only
-// Note: PWA plugin uses webpack, so we need to use --webpack flag for production builds
+// Apply PWA
+// ---------------------------------------------------------------
+// 用 DISABLE_PWA=1 显式关闭，而不是靠 NODE_ENV 判断——
+// 之前用 NODE_ENV=development 跑生产构建会让 React 的 dev/prod 版本混用，
+// 引发 "Cannot read properties of null (reading 'useContext')" 这类诡异错误。
 let finalConfig = withNextIntl(nextConfig);
 
-if (process.env.NODE_ENV === "production") {
+if (process.env.DISABLE_PWA !== "1") {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const withPWA = require("@ducanh2912/next-pwa");
@@ -95,12 +73,10 @@ if (process.env.NODE_ENV === "production") {
       register: true,
       skipWaiting: true,
       disable: false,
-      // Never precache runtime-config.js — it is rewritten at container start
-      // with the real ports/URLs and must always be fetched fresh (issue #61).
-      buildExcludes: [/middleware-manifest.json$/, /runtime-config\.js$/],
+      buildExcludes: [/middleware-manifest\.json$/, /runtime-config\.js$/],
     })(finalConfig);
   } catch {
-    // PWA not available, use base config
+    // PWA 插件不可用时忽略
   }
 }
 

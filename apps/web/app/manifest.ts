@@ -1,5 +1,9 @@
 import type { MetadataRoute } from "next";
 
+// 静态导出（output: 'export'）要求所有路由可静态生成，
+// manifest 是纯静态数据，标记为 force-static 即可参与导出。
+export const dynamic = "force-static";
+
 export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "Neko Master",

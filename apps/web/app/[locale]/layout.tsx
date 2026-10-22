@@ -7,7 +7,7 @@ import { QueryProvider } from "@/components/providers/query-provider";
 import { AuthProvider } from "@/lib/auth";
 import { AuthGuard } from "@/components/features/auth/auth-guard";
 import { NextIntlClientProvider } from "next-intl";
-import { getMessages } from "next-intl/server";
+import { getMessages, setRequestLocale } from "next-intl/server";
 import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
 import { ServiceWorkerRegister } from "@/components/common";
@@ -50,7 +50,12 @@ export const viewport: Viewport = {
   userScalable: false,
 };
 
-
+// 静态导出（output: 'export'）要求为动态路由段 /[locale] 枚举所有取值，
+// 否则构建时会报 "missing generateStaticParams"。这里按 i18n 配置的
+// locales 逐个预渲染，产出 /zh/ 与 /en/ 两套静态页面。
+export function generateStaticParams() {
+  return routing.locales.map((locale) => ({ locale }));
+}
 
 export default async function RootLayout({
   children,
@@ -61,6 +66,11 @@ export default async function RootLayout({
 }) {
   const { locale } = await params;
   if (!routing.locales.includes(locale as (typeof routing.locales)[number])) notFound();
+
+  // next-intl 静态渲染要求：必须在调用 getMessages() 等 API 之前，
+  // 把当前 locale 分发给本次渲染的所有 Server Components，
+  // 否则静态导出时会因读不到请求级 locale 而退回动态渲染。
+  setRequestLocale(locale);
 
   const messages = await getMessages();
 

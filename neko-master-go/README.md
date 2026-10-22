@@ -130,15 +130,39 @@ pnpm dev         # 等价于 air（根目录的 turbo 不包这个目录，需�
 
 ## 快速开始
 
-```bash
-# 从源码跑
-go run ./cmd/neko \
-  -seed-name home \
-  -seed-url 192.168.31.1:9090 \
-  -seed-token YOUR_MIHOMO_SECRET
+### 开发模式（前后端分开）
 
-# 编译单二进制
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o neko ./cmd/neko
+```bash
+# 后端（air 热重载，监听 3001）
+cd neko-master-go && air
+
+# 前端（Next dev，监听 3000，自动代理 /api 到 3001）
+cd apps/web && pnpm dev
+```
+
+### 单二进制部署（推荐）
+
+```bash
+cd neko-master-go
+make build      # 构建前端静态产物 + Go 单二进制
+./neko-master   # 一条命令起全栈，浏览器开 http://localhost:3001
+```
+
+产物是一个 **23MB 的自包含二进制**：UI、API、采集器全在里面，
+不依赖外部 node，也不需要在部署目录另放前端文件。把这个文件拷走就能跑。
+
+前端以 `output: 'export'` 静态导出，产物由 `//go:embed` 编进二进制（目录
+`internal/api/web/out`，由 makefile 自动拷入，不进 git）。
+前端所有请求都走相对路径（`/api/*`），因此同源部署零跨域配置。
+
+常用命令：
+
+```bash
+make build       # 完整构建（前端 + Go）
+make build-fast  # 只重建 Go，复用已有前端产物（改 Go 代码时省时间）
+make dev         # air 热重载
+make test        # go vet + go test
+make clean        清构建产牡
 ```
 
 启动后默认监听 `:3001`：
@@ -147,7 +171,24 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o neko ./cmd/neko
 curl localhost:3001/health
 curl localhost:3001/api/stats/summary
 curl localhost:3001/api/stats/global
+
+# 单二进制模式下还提供 UI：
+curl localhost:3001/zh/          # 中文界面
+curl localhost:3001/en/          # 英文界面
+curl localhost:3001/             # 302 跳 /zh/
 ```
+
+### 路由规则（静态服务）
+
+| 请求 | 行为 |
+|---|---|
+| `/api/*` | Go handler（不落入静态） |
+| `/ws` | WebSocket |
+| `/` | 302 跳到 `/zh/`（默认 locale） |
+| `/zh/`、`/en/` | 对应 locale 的 index.html |
+| `/zh/xxx`（无扩展名） | SPA fallback → `/zh/index.html` |
+| `/_next/static/...` 等真实文件 | 直接返回 |
+| 其它带扩展名但不存在 | 404（不会把缺失的 JS 当 HTML 返回） |
 
 ### Docker
 

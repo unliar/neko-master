@@ -29,6 +29,10 @@ import (
 	"github.com/unliar/neko-master/neko-master-go/internal/store"
 )
 
+// version 由 Makefile 的 -ldflags "-X main.version=..." 注入，
+// 未注入时为 dev。
+var version = "dev"
+
 func main() {
 	var (
 		seedName  = flag.String("seed-name", "", "首次启动时创建的 backend 名称")
@@ -48,6 +52,7 @@ func main() {
 	}
 	defer db.Close()
 	log.Info("database ready", "path", db.Path())
+	log.Info("neko-master", "version", version)
 
 	// 首次启动时写入默认 backend（来自 flag 或环境变量）
 	name := *seedName

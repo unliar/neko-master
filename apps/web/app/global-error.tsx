@@ -1,5 +1,12 @@
 "use client";
 
+// 静态导出时这个页面会参与预渲染，但它是 "use client" 且渲染完整
+// <html>/<body>，React 19 在 SSR 阶段拿不到 context 会抛
+// "Cannot read properties of null (reading 'useContext')"。
+// 标记 dynamic = "error" 让 Next.js 跳过它的静态预渲染（降级为 500 页）。
+// 运行时它照常工作：只有在 locale layout 崩溃时才会被触发。
+export const dynamic = "error";
+
 // Root-level error boundary — replaces the entire document when the locale
 // layout itself throws, so it must render its own <html>/<body> and use no
 // app providers or theme context.

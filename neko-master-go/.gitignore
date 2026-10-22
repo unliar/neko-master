@@ -1,12 +1,16 @@
-# air hot reload 构建产物（root .gitignore 已含 *.db / data/）
+# 构建产物
+neko-master
 tmp/
+coverage.out
+*.prof
 
-# 开发期独立库，避免热重启污染真实数据（根 gitignore 的 *.db 也会覆盖到）
+# 前端静态产物（由 make build-web 生成，//go:embed 编入二进制）
+# .gitkeep 保留，否则 embed 目录为空会编译失败
+internal/api/web/out/*
+!internal/api/web/out/.gitkeep
+
+# 开发期数据库
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
-
-# Go 覆盖率输出
-coverage.out
-*.prof
